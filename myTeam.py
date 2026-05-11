@@ -20,10 +20,8 @@
 # John DeNero (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
 # For more info, see http://inst.eecs.berkeley.edu/~cs188/sp09/pacman.html
 
-from ast import Raise
 from typing import List, Tuple
 
-from numpy import true_divide
 from captureAgents import CaptureAgent
 import distanceCalculator
 import random, time, util, sys, os
@@ -93,6 +91,8 @@ class MixedAgent(CaptureAgent):
 
     # Also can use class variable to exchange information between agents.
     CURRENT_ACTION = {}
+    sharedTargets = {}
+    sharedModes = {}
 
 
     def registerInitialState(self, gameState: GameState):
@@ -107,6 +107,18 @@ class MixedAgent(CaptureAgent):
 
         self.lowLevelPlan: List[Tuple[str,Tuple]] = []
         self.lowLevelActionIndex = 0
+        self.previousDefendingFood = self.getFoodYouAreDefending(gameState).asList()
+        self.lastEatenFood = None
+        self.currentLowLevelTarget = None
+        self.currentLowLevelMode = None
+        self.currentHighLevelAction = None
+        self.lastObservedPosition = self.startPosition
+        self.searchBudgetExhausted = False
+        self.maxLowLevelExpansions = 600
+        self.recentPositions = []
+        self.stuckRecoverySteps = 0
+        MixedAgent.sharedTargets[self.index] = self.startPosition
+        MixedAgent.sharedModes[self.index] = "patrol"
 
         # REMEMBER TRUN TRAINNING TO FALSE when submit to contest server.
         self.trainning = False # trainning mode to true will keep update weights and generate random movements by prob.
@@ -150,6 +162,8 @@ class MixedAgent(CaptureAgent):
 
         #-------------High Level Plan Section-------------------
         # Get high level action from a pddl plan.
+        self.updateDefenceMemory(gameState)
+        self.updateMovementMemory(gameState)
 
         # Collect objects and init states from gameState
         objects, initState = self.get_pddl_state(gameState)
@@ -166,8 +180,9 @@ class MixedAgent(CaptureAgent):
             self.currentNegativeGoalStates = negtiveGoal
             self.currentPositiveGoalStates = positiveGoal
             print("\tPLAN:",self.highLevelPlan)
-        if len(self.highLevelPlan)==0:
-            raise Exception("Solver retuned empty plan, you need to think how you handle this situation or how you modify your model ")
+        if self.highLevelPlan is None or len(self.highLevelPlan)==0:
+            fallbackPlan = self.getFallbackPlan(gameState)
+            return fallbackPlan[0][0]
         
         # Get next action from the plan
         highLevelAction = self.highLevelPlan[self.currentActionIndex][0].name
@@ -178,9 +193,9 @@ class MixedAgent(CaptureAgent):
         # Get the low level plan using Q learning, and return a low level action at last.
         # A low level action is defined in Directions, whihc include {"North", "South", "East", "West", "Stop"}
 
-        if not self.posSatisfyLowLevelPlan(gameState):
-            self.lowLevelPlan = self.getLowLevelPlanQL(gameState, highLevelAction) #Generate low level plan with q learning
-            # you can replace the getLowLevelPlanQL with getLowLevelPlanHS and implement heuristic search planner
+        desiredLowLevelMode = self.getEffectiveLowLevelMode(gameState, highLevelAction)
+        if not self.posSatisfyLowLevelPlan(gameState, desiredLowLevelMode, highLevelAction):
+            self.lowLevelPlan = self.getLowLevelPlanHS(gameState, highLevelAction) #Generate low level plan with heuristic search
             self.lowLevelActionIndex = 0
         lowLevelAction = self.lowLevelPlan[self.lowLevelActionIndex][0]
         self.lowLevelActionIndex+=1
@@ -383,27 +398,680 @@ class MixedAgent(CaptureAgent):
 
     #------------------------------- Heuristic search low level plan Functions -------------------------------
     def getLowLevelPlanHS(self, gameState: GameState, highLevelAction: str) -> List[Tuple[str,Tuple]]:
-        # This is a function for plan low level actions using heuristic search.
-        # You need to implement this function if you want to solve low level actions using heuristic search.
-        # Here, we list some function you might need, read the GameState and CaptureAgent code for more useful functions.
-        # These functions also useful for collecting features for Q learnning low levels.
+        mode = self.getEffectiveLowLevelMode(gameState, highLevelAction)
+        self.updateDefenceMemory(gameState)
 
-        map = gameState.getWalls() # a 2d array matrix of obstacles, map[x][y] = true means a obstacle(wall) on x,y, map[x][y] = false indicate a free location
-        foods = self.getFood(gameState) # a 2d array matrix of food,  foods[x][y] = true if there's a food.
-        capsules = self.getCapsules(gameState) # a list of capsules
-        foodNeedDefend = self.getFoodYouAreDefending(gameState) # return food will be eatan by enemy (food next to enemy)
-        capsuleNeedDefend = self.getCapsulesYouAreDefending(gameState) # return capsule will be eatan by enemy (capsule next to enemy)
-        Raise(NotImplementedError("Heuristic Search low level "))
-        return [] # You should return a list of tuple of move action and target location (exclude current location).
+        myPos = gameState.getAgentPosition(self.index)
+        if myPos is None:
+            return self.getFallbackPlan(gameState, highLevelAction=highLevelAction)
+
+        start = nearestPoint(myPos)
+        targets = self.getLowLevelTargets(gameState, mode)
+        targets = [target for target in targets if self.isLegalPosition(gameState, target)]
+
+        if not targets:
+            return self.getFallbackPlan(gameState, mode, highLevelAction=highLevelAction)
+
+        self.searchBudgetExhausted = False
+        plan = self.boundedAStarToTargets(gameState, start, targets, mode)
+        if not plan:
+            return self.getFallbackPlan(gameState, mode, targets, highLevelAction)
+
+        self.currentLowLevelMode = mode
+        self.currentHighLevelAction = highLevelAction
+        self.currentLowLevelTarget = plan[-1][1]
+        self.lastObservedPosition = start
+        MixedAgent.sharedModes[self.index] = mode
+        MixedAgent.sharedTargets[self.index] = self.currentLowLevelTarget
+        return plan # Return a list of (move action, target location), excluding current location.
+
+    def getLowLevelMode(self, highLevelAction: str) -> str:
+        actionName = str(highLevelAction).lower()
+        if "attack" in actionName or "food" in actionName or "score" in actionName:
+            return "attack"
+        if "home" in actionName or "escape" in actionName or "return" in actionName:
+            return "go_home"
+        if "defend" in actionName or "defence" in actionName:
+            return "defence"
+        return "patrol"
+
+    def getEffectiveLowLevelMode(self, gameState: GameState, highLevelAction: str) -> str:
+        mode = self.getLowLevelMode(highLevelAction)
+        if mode == "attack" and self.shouldReturnHome(gameState):
+            return "go_home"
+        cooperativeMode = self.getCooperativeModeOverride(gameState, mode)
+        if cooperativeMode is not None:
+            return cooperativeMode
+        if mode in ("attack", "patrol"):
+            agentState = gameState.getAgentState(self.index)
+            if not agentState.isPacman and (self.getVisibleInvaders(gameState) or self.lastEatenFood is not None):
+                return "defence"
+        return mode
+
+    def getCooperativeModeOverride(self, gameState: GameState, mode: str):
+        agentState = gameState.getAgentState(self.index)
+        visibleInvaders = self.getVisibleInvaders(gameState)
+
+        if self.shouldUseLateLeadDefence(gameState):
+            if agentState.isPacman:
+                return "go_home"
+            return "defence" if visibleInvaders or self.lastEatenFood is not None else "patrol"
+
+        if mode == "attack" and self.teammateHasMode(gameState, "go_home") and not self.isTeamBehind(gameState):
+            if agentState.isPacman:
+                return None
+            return "defence" if visibleInvaders or self.lastEatenFood is not None else "patrol"
+
+        return None
+
+    def shouldUseLateLeadDefence(self, gameState: GameState) -> bool:
+        timeLeft = getattr(gameState.data, "timeleft", 0)
+        return self.getScore(gameState) >= 5 and 0 < timeLeft <= 220
+
+    def isTeamBehind(self, gameState: GameState) -> bool:
+        return self.getScore(gameState) < 0
+
+    def teammateHasMode(self, gameState: GameState, mode: str) -> bool:
+        for teammate in self.getTeam(gameState):
+            if teammate != self.index and MixedAgent.sharedModes.get(teammate) == mode:
+                return True
+        return False
+
+    def shouldReturnHome(self, gameState: GameState) -> bool:
+        agentState = gameState.getAgentState(self.index)
+        myPos = agentState.getPosition()
+        if myPos is None or not agentState.isPacman:
+            return False
+
+        myPos = nearestPoint(myPos)
+        carrying = agentState.numCarrying
+        if carrying >= 3:
+            return True
+
+        dangerousGhosts = self.getVisibleDangerousGhosts(gameState)
+        ghostDistance = self.distanceToClosestTarget(myPos, dangerousGhosts) if dangerousGhosts else sys.maxsize
+        if carrying > 0 and ghostDistance <= CLOSE_DISTANCE + 1:
+            return True
+        if ghostDistance <= 2:
+            return True
+
+        homeTargets = self.getGoHomeTargets(gameState)
+        homeDistance = self.distanceToClosestTarget(myPos, homeTargets) if homeTargets else 0
+        timeLeft = getattr(gameState.data, "timeleft", 0)
+        if carrying > 0 and timeLeft > 0 and timeLeft <= (homeDistance + 5) * 4:
+            return True
+
+        if carrying > 0 and self.getScore(gameState) >= 5:
+            return True
+
+        return False
+
+    def updateDefenceMemory(self, gameState: GameState):
+        currentDefendingFood = self.getFoodYouAreDefending(gameState).asList()
+        if getattr(self, "previousDefendingFood", None):
+            eatenFood = set(self.previousDefendingFood) - set(currentDefendingFood)
+            if eatenFood:
+                myPos = gameState.getAgentPosition(self.index)
+                if myPos is None:
+                    self.lastEatenFood = list(eatenFood)[0]
+                    self.previousDefendingFood = currentDefendingFood
+                    return
+                self.lastEatenFood = min(eatenFood, key=lambda pos: util.manhattanDistance(myPos, pos))
+        myPos = gameState.getAgentPosition(self.index)
+        if self.lastEatenFood is not None and myPos is not None:
+            if util.manhattanDistance(nearestPoint(myPos), self.lastEatenFood) <= 1 and not self.getVisibleInvaders(gameState):
+                self.lastEatenFood = None
+        self.previousDefendingFood = currentDefendingFood
+
+    def updateMovementMemory(self, gameState: GameState):
+        myPos = gameState.getAgentPosition(self.index)
+        if myPos is None:
+            return
+
+        self.recentPositions.append(nearestPoint(myPos))
+        self.recentPositions = self.recentPositions[-6:]
+        if self.isDefenceOscillating():
+            self.stuckRecoverySteps = 5
+        elif self.stuckRecoverySteps > 0:
+            self.stuckRecoverySteps -= 1
+
+    def isDefenceOscillating(self) -> bool:
+        if len(self.recentPositions) < 5:
+            return False
+
+        recent = self.recentPositions[-5:]
+        return (
+            len(set(recent)) <= 2 or
+            (recent[-1] == recent[-3] == recent[-5] and recent[-2] == recent[-4])
+        )
+
+    def getLowLevelTargets(self, gameState: GameState, mode: str) -> List[Tuple[int, int]]:
+        if mode == "attack":
+            return self.getAttackTargets(gameState)
+
+        if mode == "go_home":
+            return self.getGoHomeTargets(gameState)
+
+        if mode == "defence":
+            return self.getDefenceTargets(gameState)
+
+        return self.getPatrolPoints(gameState)
+
+    def getDefenceTargets(self, gameState: GameState) -> List[Tuple[int, int]]:
+        invaders = self.getVisibleInvaders(gameState)
+        if self.stuckRecoverySteps > 0:
+            recoveryTargets = self.getAntiOscillationTargets(gameState)
+            if recoveryTargets:
+                closestInvaderDistance = sys.maxsize
+                myPos = gameState.getAgentPosition(self.index)
+                if myPos is not None and invaders:
+                    closestInvaderDistance = self.distanceToClosestTarget(nearestPoint(myPos), invaders)
+                if closestInvaderDistance > 2:
+                    return recoveryTargets
+
+        if invaders:
+            return self.sortTargetsByDistance(gameState, invaders)
+
+        targets = []
+        if self.lastEatenFood is not None and self.isLegalPosition(gameState, self.lastEatenFood):
+            targets.append(self.lastEatenFood)
+
+        capsules = [cap for cap in self.getCapsulesYouAreDefending(gameState) if self.isLegalPosition(gameState, cap)]
+        targets.extend(self.sortTargetsByDistance(gameState, capsules))
+
+        targets.extend(self.getBoundaryChokepoints(gameState))
+        targets.extend(self.getPatrolPoints(gameState))
+        return list(dict.fromkeys(targets))
+
+    def getAntiOscillationTargets(self, gameState: GameState) -> List[Tuple[int, int]]:
+        myPos = gameState.getAgentPosition(self.index)
+        if myPos is None:
+            return []
+        myPos = nearestPoint(myPos)
+
+        candidates = []
+        candidates.extend(self.getBoundaryChokepoints(gameState))
+        candidates.extend(self.getFoodClusterEntryPoints(gameState))
+        candidates.extend([cap for cap in self.getCapsulesYouAreDefending(gameState) if self.isLegalPosition(gameState, cap)])
+        candidates.extend(self.getHomeBoundaryPoints(gameState))
+
+        recentSet = set(self.recentPositions[-4:])
+        uniqueCandidates = [
+            candidate for candidate in dict.fromkeys(candidates)
+            if self.isLegalPosition(gameState, candidate) and candidate not in recentSet
+        ]
+        return sorted(
+            uniqueCandidates,
+            key=lambda target: (
+                -self.distanceToClosestTarget(target, list(recentSet)) if recentSet else 0,
+                util.manhattanDistance(myPos, target),
+            )
+        )[:3]
+
+    def getGoHomeTargets(self, gameState: GameState) -> List[Tuple[int, int]]:
+        boundaryPoints = self.getHomeBoundaryPoints(gameState)
+        if not boundaryPoints:
+            return []
+
+        ranked = sorted(boundaryPoints, key=lambda target: self.getHomeTargetScore(gameState, target))
+        safest = [
+            target for target in ranked
+            if self.getGhostTargetPenalty(gameState, target) < 80
+        ]
+        return (safest or ranked)[:1]
+
+    def getHomeTargetScore(self, gameState: GameState, target: Tuple[int, int]) -> float:
+        myPos = gameState.getAgentPosition(self.index)
+        distance = util.manhattanDistance(nearestPoint(myPos), target) if myPos is not None else 0
+        score = distance + self.getGhostTargetPenalty(gameState, target)
+        if self.isChokepoint(gameState, target):
+            score += 2
+        return score
+
+    def getAttackTargets(self, gameState: GameState) -> List[Tuple[int, int]]:
+        myPos = gameState.getAgentPosition(self.index)
+        if myPos is None:
+            return []
+        myPos = nearestPoint(myPos)
+
+        foods = [food for food in self.getFood(gameState).asList() if self.isLegalPosition(gameState, food)]
+        capsules = [cap for cap in self.getCapsules(gameState) if self.isLegalPosition(gameState, cap)]
+        dangerousGhosts = self.getVisibleDangerousGhosts(gameState)
+
+        if not foods:
+            return self.rankAttackTargets(gameState, capsules)
+
+        safeFoods = [food for food in foods if self.isSafeAttackFood(food, dangerousGhosts)]
+        ghostPressure = (
+            dangerousGhosts and
+            self.distanceToClosestTarget(myPos, dangerousGhosts) <= CLOSE_DISTANCE + 1
+        )
+
+        if ghostPressure and capsules:
+            capsuleTargets = self.rankAttackTargets(gameState, capsules)
+            if not safeFoods:
+                return capsuleTargets[:1]
+            nearestSafeFood = self.distanceToClosestTarget(myPos, safeFoods)
+            nearestCapsule = self.distanceToClosestTarget(myPos, capsuleTargets)
+            if nearestCapsule <= nearestSafeFood + 2:
+                return capsuleTargets[:1]
+
+        if safeFoods:
+            return self.rankAttackTargets(gameState, safeFoods)[:1]
+
+        if capsules:
+            return self.rankAttackTargets(gameState, capsules)[:1]
+
+        return self.rankAttackTargets(gameState, foods)[:1]
+
+    def rankAttackTargets(self, gameState: GameState, targets: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        return sorted(targets, key=lambda target: self.getAttackTargetScore(gameState, target))
+
+    def getAttackTargetScore(self, gameState: GameState, target: Tuple[int, int]) -> float:
+        myPos = gameState.getAgentPosition(self.index)
+        if myPos is None:
+            return 0
+        myPos = nearestPoint(myPos)
+        score = util.manhattanDistance(myPos, target)
+        score += self.getGhostTargetPenalty(gameState, target)
+        score += self.getTeammateTargetPenalty(gameState, target)
+        score += self.getRegionalAttackPenalty(gameState, target)
+        return score
+
+    def getRegionalAttackPenalty(self, gameState: GameState, target: Tuple[int, int]) -> float:
+        if self.isTeamBehind(gameState):
+            return 0
+
+        walls = gameState.getWalls()
+        centreY = walls.height // 2
+        assignedSide = -1 if self.index == min(self.getTeam(gameState)) else 1
+        targetSide = -1 if target[1] < centreY else 1
+
+        penalty = 0
+        if targetSide != assignedSide:
+            penalty += 6
+
+        for teammate in self.getTeam(gameState):
+            if teammate == self.index or MixedAgent.sharedModes.get(teammate) != "attack":
+                continue
+            teammateTarget = MixedAgent.sharedTargets.get(teammate)
+            if teammateTarget is None:
+                continue
+            teammateTarget = nearestPoint(teammateTarget)
+            teammateSide = -1 if teammateTarget[1] < centreY else 1
+            if targetSide == teammateSide:
+                penalty += 5
+
+        return penalty
+
+    def isSafeAttackFood(self, food: Tuple[int, int], dangerousGhosts: List[Tuple[int, int]]) -> bool:
+        if not dangerousGhosts:
+            return True
+        return self.distanceToClosestTarget(food, dangerousGhosts) > 2
+
+    def getVisibleDangerousGhosts(self, gameState: GameState) -> List[Tuple[int, int]]:
+        ghosts = []
+        for opponent in self.getOpponents(gameState):
+            opponentState = gameState.getAgentState(opponent)
+            opponentPos = opponentState.getPosition()
+            if opponentPos is None:
+                continue
+            if not opponentState.isPacman and opponentState.scaredTimer <= 1:
+                ghosts.append(nearestPoint(opponentPos))
+        return ghosts
+
+    def getGhostTargetPenalty(self, gameState: GameState, target: Tuple[int, int]) -> float:
+        dangerousGhosts = self.getVisibleDangerousGhosts(gameState)
+        if not dangerousGhosts:
+            return 0
+
+        carrying = gameState.getAgentState(self.index).numCarrying
+        multiplier = 1 + min(carrying, 6) * 0.35
+        ghostDistance = self.distanceToClosestTarget(target, dangerousGhosts)
+        if ghostDistance <= 1:
+            return 80 * multiplier
+        if ghostDistance == 2:
+            return 25 * multiplier
+        if ghostDistance <= CLOSE_DISTANCE:
+            return 6 * multiplier
+        return 0
+
+    def getTeammateTargetPenalty(self, gameState: GameState, target: Tuple[int, int]) -> float:
+        penalty = 0
+        myPos = gameState.getAgentPosition(self.index)
+        if myPos is None:
+            return penalty
+        myPos = nearestPoint(myPos)
+
+        for teammate in self.getTeam(gameState):
+            if teammate == self.index:
+                continue
+
+            teammateTarget = MixedAgent.sharedTargets.get(teammate)
+            if teammateTarget is None:
+                continue
+
+            targetDistance = util.manhattanDistance(target, teammateTarget)
+            if targetDistance <= 6:
+                penalty += 10 + (6 - targetDistance) * 2
+                teammatePos = gameState.getAgentPosition(teammate)
+                if teammatePos is not None:
+                    teammatePos = nearestPoint(teammatePos)
+                    if util.manhattanDistance(teammatePos, teammateTarget) <= util.manhattanDistance(myPos, target):
+                        penalty += 8
+
+        return penalty
+
+    def sortTargetsByDistance(self, gameState: GameState, targets: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        myPos = gameState.getAgentPosition(self.index)
+        if myPos is None:
+            return targets
+        return sorted(targets, key=lambda target: util.manhattanDistance(nearestPoint(myPos), target))
+
+    def getVisibleInvaders(self, gameState: GameState) -> List[Tuple[int, int]]:
+        invaders = []
+        for opponent in self.getOpponents(gameState):
+            opponentState = gameState.getAgentState(opponent)
+            opponentPos = opponentState.getPosition()
+            if opponentState.isPacman and opponentPos is not None:
+                invaders.append(nearestPoint(opponentPos))
+        return invaders
+
+    def getHomeBoundaryPoints(self, gameState: GameState) -> List[Tuple[int, int]]:
+        walls = gameState.getWalls()
+        boundaryX = walls.width // 2 - 1 if self.red else walls.width // 2
+        return [(boundaryX, y) for y in range(1, walls.height - 1) if not walls[boundaryX][y]]
+
+    def getPatrolPoints(self, gameState: GameState) -> List[Tuple[int, int]]:
+        patrolPoints = []
+        patrolPoints.extend(self.getBoundaryChokepoints(gameState))
+        patrolPoints.extend(self.getFoodClusterEntryPoints(gameState))
+        patrolPoints.extend([cap for cap in self.getCapsulesYouAreDefending(gameState) if self.isLegalPosition(gameState, cap)])
+        patrolPoints.extend(self.getTeammateUncoveredPatrolPoints(gameState))
+        patrolPoints.extend(self.getHomeBoundaryPoints(gameState))
+
+        uniquePoints = [point for point in dict.fromkeys(patrolPoints) if self.isLegalPosition(gameState, point)]
+        return sorted(uniquePoints, key=lambda target: self.getPatrolTargetScore(gameState, target))[:8]
+
+    def getBoundaryChokepoints(self, gameState: GameState) -> List[Tuple[int, int]]:
+        boundaryPoints = self.getHomeBoundaryPoints(gameState)
+        if not boundaryPoints:
+            return []
+
+        walls = gameState.getWalls()
+        centreY = walls.height // 2
+        chokepoints = [point for point in boundaryPoints if self.isChokepoint(gameState, point)]
+        candidates = chokepoints or boundaryPoints
+        return sorted(candidates, key=lambda pos: (abs(pos[1] - centreY), util.manhattanDistance(pos, self.startPosition)))[:5]
+
+    def getFoodClusterEntryPoints(self, gameState: GameState) -> List[Tuple[int, int]]:
+        defendingFood = self.getFoodYouAreDefending(gameState).asList()
+        boundaryPoints = self.getHomeBoundaryPoints(gameState)
+        if not defendingFood or not boundaryPoints:
+            return []
+
+        lowerFoods = [food for food in defendingFood if food[1] < gameState.getWalls().height // 2]
+        upperFoods = [food for food in defendingFood if food[1] >= gameState.getWalls().height // 2]
+        clusters = [foods for foods in (lowerFoods, upperFoods) if foods]
+
+        entries = []
+        for foods in clusters:
+            centroidY = sum(food[1] for food in foods) / float(len(foods))
+            entries.append(min(boundaryPoints, key=lambda point: abs(point[1] - centroidY)))
+        return entries
+
+    def getTeammateUncoveredPatrolPoints(self, gameState: GameState) -> List[Tuple[int, int]]:
+        boundaryPoints = self.getHomeBoundaryPoints(gameState)
+        if not boundaryPoints:
+            return []
+
+        walls = gameState.getWalls()
+        centreY = walls.height // 2
+        teammateYs = []
+        for teammate in self.getTeam(gameState):
+            if teammate == self.index:
+                continue
+            teammateTarget = MixedAgent.sharedTargets.get(teammate)
+            teammatePos = gameState.getAgentPosition(teammate)
+            reference = teammateTarget if teammateTarget is not None else teammatePos
+            if reference is not None:
+                teammateYs.append(nearestPoint(reference)[1])
+
+        if not teammateYs:
+            preferredSide = -1 if self.index == min(self.getTeam(gameState)) else 1
+        else:
+            preferredSide = -1 if sum(teammateYs) / float(len(teammateYs)) >= centreY else 1
+
+        sidePoints = [
+            point for point in boundaryPoints
+            if (point[1] - centreY) * preferredSide >= 0
+        ]
+        return sorted(sidePoints or boundaryPoints, key=lambda point: abs(point[1] - centreY))[:3]
+
+    def getPatrolTargetScore(self, gameState: GameState, target: Tuple[int, int]) -> float:
+        myPos = gameState.getAgentPosition(self.index)
+        distance = util.manhattanDistance(nearestPoint(myPos), target) if myPos is not None else 0
+        score = distance
+        if self.isChokepoint(gameState, target):
+            score -= 3
+        if target in self.getCapsulesYouAreDefending(gameState):
+            score -= 2
+        score += self.getTeammateTargetPenalty(gameState, target) * 0.5
+        return score
+
+    def isLegalPosition(self, gameState: GameState, pos: Tuple[int, int]) -> bool:
+        walls = gameState.getWalls()
+        x, y = int(pos[0]), int(pos[1])
+        return 0 <= x < walls.width and 0 <= y < walls.height and not walls[x][y]
+
+    def getLegalSearchActions(self, gameState: GameState, pos: Tuple[int, int]) -> List[str]:
+        legalActions = []
+        for action in [Directions.NORTH, Directions.SOUTH, Directions.EAST, Directions.WEST]:
+            nextPos = nearestPoint(Actions.getSuccessor(pos, action))
+            if self.isLegalPosition(gameState, nextPos):
+                legalActions.append(action)
+        return legalActions
+
+    def isChokepoint(self, gameState: GameState, pos: Tuple[int, int]) -> bool:
+        legalNeighbors = Actions.getLegalNeighbors(pos, gameState.getWalls())
+        if len(legalNeighbors) <= 2:
+            return True
+
+        walls = gameState.getWalls()
+        nearMiddle = abs(pos[0] - walls.width // 2) <= 2
+        return nearMiddle and len(legalNeighbors) <= 3
+
+    def boundedAStarToTargets(self, gameState: GameState, start: Tuple[int, int], targets: List[Tuple[int, int]], mode: str) -> List[Tuple[str, Tuple]]:
+        targetSet = set(targets)
+        if start in targetSet:
+            return []
+
+        frontier = util.PriorityQueue()
+        frontier.push((start, [], 0), self.distanceToClosestTarget(start, targets))
+        bestCost = {start: 0}
+        expansions = 0
+
+        while not frontier.isEmpty() and expansions < self.maxLowLevelExpansions:
+            pos, path, costSoFar = frontier.pop()
+
+            if costSoFar > bestCost.get(pos, sys.maxsize):
+                continue
+
+            if pos in targetSet:
+                return path
+
+            expansions += 1
+            for action in self.getLegalSearchActions(gameState, pos):
+                nextPos = nearestPoint(Actions.getSuccessor(pos, action))
+                newCost = costSoFar + self.getSearchStepCost(gameState, pos, nextPos, targets, mode)
+                if newCost >= bestCost.get(nextPos, sys.maxsize):
+                    continue
+                bestCost[nextPos] = newCost
+                priority = newCost + self.distanceToClosestTarget(nextPos, targets)
+                frontier.push((nextPos, path + [(action, nextPos)], newCost), priority)
+
+        self.searchBudgetExhausted = expansions >= self.maxLowLevelExpansions
+        return []
+
+    def getSearchStepCost(self, gameState: GameState, pos: Tuple[int, int], nextPos: Tuple[int, int], targets: List[Tuple[int, int]], mode: str) -> float:
+        stepCost = 1
+        carrying = gameState.getAgentState(self.index).numCarrying
+        carryingRiskMultiplier = 1 + min(carrying, 6) * 0.45
+
+        dangerousGhosts = self.getVisibleDangerousGhosts(gameState)
+        if dangerousGhosts:
+            ghostDistance = self.distanceToClosestTarget(nextPos, dangerousGhosts)
+            if ghostDistance == 0:
+                stepCost += 100 * carryingRiskMultiplier
+            elif ghostDistance == 1:
+                stepCost += 35 * carryingRiskMultiplier
+            elif ghostDistance == 2:
+                stepCost += 12 * carryingRiskMultiplier
+            elif ghostDistance <= CLOSE_DISTANCE:
+                stepCost += 3 * carryingRiskMultiplier
+
+            if carrying > 0 and ghostDistance <= CLOSE_DISTANCE and self.isChokepoint(gameState, nextPos):
+                stepCost += 8 + carrying * 2
+            elif mode == "go_home" and ghostDistance <= 2 and self.isChokepoint(gameState, nextPos):
+                stepCost += 8
+
+        stepCost += self.getTeammateStepConflictPenalty(gameState, nextPos)
+        stepCost += self.getRecentPositionPenalty(nextPos, mode)
+
+        currentTargetDistance = self.distanceToClosestTarget(pos, targets)
+        nextTargetDistance = self.distanceToClosestTarget(nextPos, targets)
+        if nextTargetDistance < currentTargetDistance:
+            stepCost -= 0.15
+        elif nextTargetDistance > currentTargetDistance:
+            stepCost += 0.25
+
+        return max(0.2, stepCost)
+
+    def getRecentPositionPenalty(self, nextPos: Tuple[int, int], mode: str) -> float:
+        if mode not in ("defence", "patrol") or not self.recentPositions:
+            return 0
+
+        recent = self.recentPositions[-5:]
+        if nextPos == recent[-1]:
+            return 4
+        if nextPos in recent[-3:]:
+            return 2.5
+        if nextPos in recent:
+            return 1
+        return 0
+
+    def getTeammateStepConflictPenalty(self, gameState: GameState, nextPos: Tuple[int, int]) -> float:
+        penalty = 0
+        for teammate in self.getTeam(gameState):
+            if teammate == self.index:
+                continue
+            teammateTarget = MixedAgent.sharedTargets.get(teammate)
+            if teammateTarget is None:
+                continue
+
+            distance = util.manhattanDistance(nextPos, teammateTarget)
+            if distance <= 2:
+                penalty += 7
+            elif distance <= 4:
+                penalty += 2.5
+        return penalty
+
+    def distanceToClosestTarget(self, pos: Tuple[int, int], targets: List[Tuple[int, int]]) -> int:
+        if not targets:
+            return 0
+        return min(util.manhattanDistance(pos, target) for target in targets)
+
+    def getFallbackPlan(self, gameState: GameState, mode: str = "patrol", targets: List[Tuple[int, int]] = None, highLevelAction: str = None) -> List[Tuple[str, Tuple]]:
+        action = self.getFallbackAction(gameState, targets, mode)
+        myPos = gameState.getAgentPosition(self.index)
+        nextPos = Actions.getSuccessor(myPos, action) if myPos is not None else myPos
+        nextPos = nearestPoint(nextPos) if nextPos is not None else nextPos
+
+        self.currentLowLevelMode = mode
+        self.currentHighLevelAction = highLevelAction
+        self.currentLowLevelTarget = nextPos
+        self.lastObservedPosition = nearestPoint(myPos) if myPos is not None else myPos
+        MixedAgent.sharedModes[self.index] = mode
+        MixedAgent.sharedTargets[self.index] = nextPos
+        return [(action, nextPos)]
+
+    def getFallbackAction(self, gameState: GameState, targets: List[Tuple[int, int]] = None, mode: str = "patrol") -> str:
+        legalActions = [action for action in gameState.getLegalActions(self.index) if action != Directions.STOP]
+        if not legalActions:
+            return Directions.STOP
+
+        myPos = gameState.getAgentPosition(self.index)
+        if myPos is None:
+            return legalActions[0]
+
+        if targets:
+            return min(
+                legalActions,
+                key=lambda action: self.getFallbackActionScore(gameState, myPos, action, targets, mode)
+            )
+
+        reverse = Directions.REVERSE[gameState.getAgentState(self.index).configuration.direction]
+        nonReverse = [action for action in legalActions if action != reverse]
+        candidates = nonReverse if nonReverse else legalActions
+        return min(candidates, key=lambda action: self.getFallbackActionScore(gameState, myPos, action, targets, mode))
+
+    def getFallbackActionScore(self, gameState: GameState, myPos: Tuple[int, int], action: str, targets: List[Tuple[int, int]], mode: str) -> float:
+        nextPos = nearestPoint(Actions.getSuccessor(myPos, action))
+        score = self.distanceToClosestTarget(nextPos, targets) if targets else 0
+        score += self.getSearchStepCost(gameState, nearestPoint(myPos), nextPos, targets or [nextPos], mode)
+        return score
     
-    def posSatisfyLowLevelPlan(self,gameState: GameState):
+    def posSatisfyLowLevelPlan(self, gameState: GameState, expectedMode: str = None, expectedHighLevelAction: str = None):
         if self.lowLevelPlan == None or len(self.lowLevelPlan)==0 or self.lowLevelActionIndex >= len(self.lowLevelPlan):
             return False
+        if expectedMode is not None and self.currentLowLevelMode != expectedMode:
+            return False
+        if expectedHighLevelAction is not None and self.currentHighLevelAction != expectedHighLevelAction:
+            return False
+        if not self.currentLowLevelTargetStillValid(gameState):
+            return False
         myPos = gameState.getAgentPosition(self.index)
-        nextPos = Actions.getSuccessor(myPos,self.lowLevelPlan[self.lowLevelActionIndex][0])
+        if myPos is None:
+            return False
+        myGridPos = nearestPoint(myPos)
+        if self.lastObservedPosition is not None and myGridPos == self.startPosition and self.lastObservedPosition != self.startPosition:
+            return False
+        nextAction = self.lowLevelPlan[self.lowLevelActionIndex][0]
+        if nextAction not in gameState.getLegalActions(self.index):
+            return False
+        nextPos = Actions.getSuccessor(myPos,nextAction)
+        nextPos = nearestPoint(nextPos)
         if nextPos != self.lowLevelPlan[self.lowLevelActionIndex][1]:
             return False
+        self.lastObservedPosition = myGridPos
         return True
+
+    def currentLowLevelTargetStillValid(self, gameState: GameState) -> bool:
+        if self.currentLowLevelTarget is None:
+            return True
+
+        if self.currentLowLevelMode == "attack":
+            return self.currentLowLevelTarget in set(self.getAttackTargets(gameState))
+
+        if self.currentLowLevelMode == "go_home":
+            return self.currentLowLevelTarget in set(self.getGoHomeTargets(gameState))
+
+        if self.currentLowLevelMode == "defence":
+            defenceTargets = self.getDefenceTargets(gameState)
+            if self.stuckRecoverySteps > 0 and self.currentLowLevelTarget in set(defenceTargets):
+                return True
+            if self.getVisibleInvaders(gameState):
+                return self.currentLowLevelTarget in set(self.getVisibleInvaders(gameState))
+            if self.lastEatenFood is not None:
+                return self.currentLowLevelTarget == self.lastEatenFood
+            return self.currentLowLevelTarget in set(defenceTargets[:5])
+
+        if self.currentLowLevelMode == "patrol":
+            if self.getVisibleInvaders(gameState) or self.lastEatenFood is not None:
+                return False
+            return self.currentLowLevelTarget in set(self.getPatrolPoints(gameState))
+
+        return self.isLegalPosition(gameState, self.currentLowLevelTarget)
 
     #------------------------------- Q-learning low level plan Functions -------------------------------
 
@@ -705,4 +1373,3 @@ class MixedAgent(CaptureAgent):
                                 ghosts.append(opPos)
         return ghosts
     
-
