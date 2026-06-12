@@ -103,3 +103,4 @@ Finally, you can access the list of noisy distance observations via getAgentDist
 ### Distance Calculation
 
 To facilitate agent development, we provide code in distanceCalculator.py to supply shortest path maze distances.
+# pacman
