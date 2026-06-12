@@ -151,11 +151,75 @@ class MixedAgent(CaptureAgent):
         # behaves identically to pure HS.
         self.qlGuidedAStar = True  # passed the full Phase 11 acceptance matrix, on by default
         self.qlPathLambda = 0.03  # scale of (maxQ - q) added to the step cost
+        # Phase 12.1 sweep knob: QL_PATH_LAMBDA overrides qlPathLambda for a batch
+        # without editing this file between runs (same accident-surface rationale as
+        # QL_PATH_ABLATE). Unset, the default, changes nothing.
+        if os.environ.get("QL_PATH_LAMBDA"):
+            self.qlPathLambda = float(os.environ["QL_PATH_LAMBDA"])
+            print("[QL] qlPathLambda override -> %.3f (agent %d)" % (self.qlPathLambda, self.index), file=sys.stderr)
         self.qlPathCap = 1.0  # max extra cost per step from the QL preference
         # Phase 11.0 diagnostic knob: comma separated offensive feature names whose
         # weights are zeroed inside the search-time Q adapter only (training and the
         # weights file stay untouched). Empty, the default, changes nothing.
         self.qlPathAblateFeatures = set(filter(None, os.environ.get("QL_PATH_ABLATE", "").split(",")))
+        # Phase 12.2 pre-diagnostic: QL_PATH_RISK_DIAG=1 counts how often the candidate
+        # binary risk events fire inside the path adapter and how often the hard ghost
+        # penalty of getSearchStepCost fires on the same cell (overlap = the QL term is
+        # redundant there). Read-only counters, never change behaviour; final() prints
+        # one QL-RISK-DIAG line per game (needs -q to be visible).
+        self.qlRiskDiag = bool(os.environ.get("QL_PATH_RISK_DIAG"))
+        self.riskDiagCounts = {"evals": 0, "homecut": 0, "homecut_hard": 0,
+                               "tunnelghost": 0, "tunnelghost_hard": 0}
+        # Phase 12.2a (REJECTED, kept as an experiment knob): hand-set weight for the
+        # binary home-cut-risk event (carrying > 0 and every home boundary escape
+        # margin collapsed to <= 1). A shaped risk prior, NOT a learned Q weight.
+        # Verdict: even at -30 (saturating qlPathCap on flagged cells) all 49 RANDOM23
+        # games kept byte-identical scores and blox/default stayed neutral — flagged
+        # cells never sit on a competitive A* branch, the existing risk stack already
+        # dominates. 0, the default, changes nothing.
+        self.qlPathRiskWeight = float(os.environ.get("QL_PATH_RISK_W", "0"))
+        if self.qlPathRiskWeight:
+            print("[QL] home-cut-risk weight -> %.2f (agent %d)" % (self.qlPathRiskWeight, self.index), file=sys.stderr)
+        # Phase 13.1: scared harvest window (HS_SCARED_WINDOW=1). While every
+        # opponent stays scared for longer than the trip home, shouldReturnHome
+        # raises the carrying threshold from 3 to 8 and skips the early lead
+        # return, so the capsule buys a full harvest instead of one extra food.
+        # Unset, the default, changes nothing.
+        self.scaredWindowEnabled = bool(os.environ.get("HS_SCARED_WINDOW"))
+        # Phase 13.2: capsule detour (HS_CAPSULE_DETOUR=1). When a ghost-pressure
+        # return-home fires and a capsule is closer than the boundary (and not
+        # guarded), go_home targets the capsule first. Unset changes nothing.
+        self.capsuleDetourEnabled = bool(os.environ.get("HS_CAPSULE_DETOUR"))
+        # Phase 13.3: scared defence self-preservation (HS_SCARED_DEF=1). A scared
+        # defender shadows visible invaders from 2-3 cells instead of body-blocking
+        # them, and A* charges extra for cells adjacent to an invader while scared.
+        # Unset changes nothing.
+        self.scaredDefenceEnabled = bool(os.environ.get("HS_SCARED_DEF"))
+        # Phase 13.4: defence interception (HS_INTERCEPT=1). When a chase makes no
+        # progress, target the cut-off point between the invader and its escape
+        # boundary instead of its current cell. Unset changes nothing.
+        self.interceptEnabled = bool(os.environ.get("HS_INTERCEPT"))
+        self.chaseNoGainStreak = 0
+        self.lastChaseDistance = None
+        # Phase 13.0: read-only defence/capsule-timing diagnostic counters
+        # (HS_DEF_DIAG=1). They never change behaviour, final() prints one
+        # DEF-DIAG line per game (needs -q to be visible).
+        self.defDiagnostics = bool(os.environ.get("HS_DEF_DIAG"))
+        self.defDiagCounts = {
+            "capsuleLost": 0,       # our defending capsules eaten by the opponent
+            "invaderSteps": 0,      # steps with at least one visible invader on our side
+            "scaredChaseSteps": 0,  # steps where we are scared and within 2 of a visible invader
+            "chaseSteps": 0,        # defence-mode steps chasing a visible invader
+            "chaseNoGain": 0,       # of those, steps where the distance did not shrink
+            "scaredWindowSteps": 0, # steps while at least one opponent ghost is scared
+            "scaredWindowFood": 0,  # food we ate during such a scared window
+            "safeWindowSteps": 0,   # of those, steps where isInSafeScaredWindow held
+            "capsuleDetours": 0,    # go_home target evaluations resolved to a capsule
+        }
+        self.defDiagPrevCapsules = len(self.getCapsulesYouAreDefending(gameState))
+        self.defDiagPrevCarrying = 0
+        self.defDiagPrevChaseDist = None
+        self.defDiagInitialFood = len(self.getFoodYouAreDefending(gameState).asList())
         # Read-only diagnostic counters for the q learning experiments (Phase 9.0).
         # They never change behaviour, final() prints one QL-DIAG line per game.
         self.qlDiagnostics = False
@@ -209,6 +273,11 @@ class MixedAgent(CaptureAgent):
             file = open(MixedAgent.QLWeightsFile, 'w')
             file.write(str(MixedAgent.QLWeights))
             file.close()
+        if self.qlRiskDiag:
+            print("QL-RISK-DIAG agent", self.index, self.riskDiagCounts)
+        if self.defDiagnostics:
+            foodLost = self.defDiagInitialFood - len(self.getFoodYouAreDefending(gameState).asList())
+            print("DEF-DIAG agent", self.index, "foodLost", foodLost, self.defDiagCounts)
         if self.qlDiagnostics:
             print("QL-DIAG agent", self.index,
                   "maxCarrying", self.diagMaxCarrying,
@@ -264,6 +333,8 @@ class MixedAgent(CaptureAgent):
         desiredLowLevelMode = self.getEffectiveLowLevelMode(gameState, highLevelAction)
         if self.qlDiagnostics:
             self.updateQLDiagnostics(gameState, desiredLowLevelMode)
+        if self.defDiagnostics:
+            self.updateDefenceDiagnostics(gameState, desiredLowLevelMode)
         if desiredLowLevelMode in self.qlLowLevelModes:
             # Q learning picks one action per step (and updates weights in trainning mode)
             self.lowLevelPlan = self.getLowLevelPlanQL(gameState, highLevelAction)
@@ -605,7 +676,12 @@ class MixedAgent(CaptureAgent):
 
         myPos = nearestPoint(myPos)
         carrying = agentState.numCarrying
-        if carrying >= 3:
+
+        # Phase 13.1: while every opponent stays scared for longer than the trip home,
+        # keep harvesting instead of banking at 3 (the capsule already paid for safety).
+        scaredWindow = self.scaredWindowEnabled and self.isInSafeScaredWindow(gameState, myPos)
+        carryThreshold = 8 if scaredWindow else 3
+        if carrying >= carryThreshold:
             return True
 
         dangerousGhosts = self.getVisibleDangerousGhosts(gameState)
@@ -621,10 +697,33 @@ class MixedAgent(CaptureAgent):
         if carrying > 0 and timeLeft > 0 and timeLeft <= (homeDistance + 5) * 4:
             return True
 
-        if carrying > 0 and self.getScore(gameState) >= 5:
+        if carrying > 0 and self.getScore(gameState) >= 5 and not scaredWindow:
             return True
 
         return False
+
+    def isInSafeScaredWindow(self, gameState: GameState, myPos: Tuple[int, int]) -> bool:
+        # Safe = the scared clock outlasts the trip home and no awake ghost is
+        # closing in. An opponent whose timer reset (eaten by our defence) respawns
+        # far away; the existing close-ghost triggers stay armed for it, so it only
+        # closes the window once it actually shows up nearby.
+        maxScared = max(
+            gameState.getAgentState(opponent).scaredTimer
+            for opponent in self.getOpponents(gameState)
+        )
+        if maxScared <= 0:
+            return False
+        boundaryPoints = self.getHomeBoundaryPoints(gameState)
+        if not boundaryPoints:
+            return False
+        homeDistance = min(self.getMazeDistance(myPos, point) for point in boundaryPoints)
+        if maxScared <= homeDistance + 8:
+            return False
+        dangerousGhosts = self.getVisibleDangerousGhosts(gameState)
+        return not (
+            dangerousGhosts and
+            self.distanceToClosestTarget(myPos, dangerousGhosts) <= CLOSE_DISTANCE + 2
+        )
 
     def updateQLDiagnostics(self, gameState: GameState, mode: str):
         # Read-only counters used by the q learning experiments, never changes behaviour.
@@ -657,6 +756,48 @@ class MixedAgent(CaptureAgent):
         self.diagPrevCarrying = carrying
         self.diagPrevPos = myPos
 
+    def updateDefenceDiagnostics(self, gameState: GameState, mode: str):
+        # Phase 13.0 read-only counters, never change behaviour.
+        myState = gameState.getAgentState(self.index)
+        myPos = myState.getPosition()
+        if myPos is None:
+            return
+        myPos = nearestPoint(myPos)
+
+        capsuleCount = len(self.getCapsulesYouAreDefending(gameState))
+        if capsuleCount < self.defDiagPrevCapsules:
+            self.defDiagCounts["capsuleLost"] += self.defDiagPrevCapsules - capsuleCount
+        self.defDiagPrevCapsules = capsuleCount
+
+        invaders = self.getVisibleInvaders(gameState)
+        if invaders:
+            self.defDiagCounts["invaderSteps"] += 1
+            invaderDistance = min(self.getMazeDistance(myPos, invader) for invader in invaders)
+            if myState.scaredTimer > 0 and invaderDistance <= 2:
+                self.defDiagCounts["scaredChaseSteps"] += 1
+            if mode == "defence":
+                self.defDiagCounts["chaseSteps"] += 1
+                if self.defDiagPrevChaseDist is not None and invaderDistance >= self.defDiagPrevChaseDist:
+                    self.defDiagCounts["chaseNoGain"] += 1
+                self.defDiagPrevChaseDist = invaderDistance
+            else:
+                self.defDiagPrevChaseDist = None
+        else:
+            self.defDiagPrevChaseDist = None
+
+        scaredWindow = any(
+            gameState.getAgentState(opponent).scaredTimer > 0
+            for opponent in self.getOpponents(gameState)
+        )
+        carrying = myState.numCarrying
+        if scaredWindow:
+            self.defDiagCounts["scaredWindowSteps"] += 1
+            if carrying > self.defDiagPrevCarrying:
+                self.defDiagCounts["scaredWindowFood"] += carrying - self.defDiagPrevCarrying
+            if self.isInSafeScaredWindow(gameState, myPos):
+                self.defDiagCounts["safeWindowSteps"] += 1
+        self.defDiagPrevCarrying = carrying
+
     def updateDefenceMemory(self, gameState: GameState):
         currentDefendingFood = self.getFoodYouAreDefending(gameState).asList()
         if getattr(self, "previousDefendingFood", None):
@@ -685,6 +826,19 @@ class MixedAgent(CaptureAgent):
             self.stuckRecoverySteps = 5
         elif self.stuckRecoverySteps > 0:
             self.stuckRecoverySteps -= 1
+
+        # Phase 13.4: track whether an active defence chase is making progress
+        invaders = self.getVisibleInvaders(gameState)
+        if invaders and self.currentLowLevelMode == "defence":
+            chaseDistance = min(self.getMazeDistance(nearestPoint(myPos), invader) for invader in invaders)
+            if self.lastChaseDistance is not None and chaseDistance >= self.lastChaseDistance:
+                self.chaseNoGainStreak += 1
+            else:
+                self.chaseNoGainStreak = 0
+            self.lastChaseDistance = chaseDistance
+        else:
+            self.chaseNoGainStreak = 0
+            self.lastChaseDistance = None
 
     def isDefenceOscillating(self) -> bool:
         if len(self.recentPositions) < 5:
@@ -720,7 +874,27 @@ class MixedAgent(CaptureAgent):
                 if closestInvaderDistance > 2:
                     return recoveryTargets
 
+        # Phase 13.3: a scared defender that touches the invader just feeds it a free
+        # kill; shadow it from 2-3 cells away until the scared timer runs out.
+        if (
+            invaders and self.scaredDefenceEnabled and
+            gameState.getAgentState(self.index).scaredTimer > 0
+        ):
+            shadowTargets = self.getScaredShadowTargets(gameState, invaders)
+            if shadowTargets:
+                return shadowTargets
+            guardSpots = [cap for cap in self.getCapsulesYouAreDefending(gameState) if self.isLegalPosition(gameState, cap)]
+            guardSpots.extend(self.getFoodClusterEntryPoints(gameState))
+            if guardSpots:
+                return list(dict.fromkeys(guardSpots))
+
         if invaders:
+            # Phase 13.4: tail-chasing at equal speed never catches up; once the
+            # chase stalls, cut off the invader's escape exit instead.
+            if self.interceptEnabled and self.chaseNoGainStreak >= 3:
+                interceptTarget = self.getInterceptTarget(gameState, invaders)
+                if interceptTarget is not None:
+                    return [interceptTarget]
             return self.sortTargetsByDistance(gameState, invaders)
 
         targets = []
@@ -733,6 +907,55 @@ class MixedAgent(CaptureAgent):
         targets.extend(self.getBoundaryChokepoints(gameState))
         targets.extend(self.getPatrolPoints(gameState))
         return list(dict.fromkeys(targets))
+
+    def getInterceptTarget(self, gameState: GameState, invaders: List[Tuple[int, int]]):
+        myPos = gameState.getAgentPosition(self.index)
+        if myPos is None or not invaders:
+            return None
+        myPos = nearestPoint(myPos)
+        invader = min(invaders, key=lambda inv: self.getMazeDistance(myPos, inv))
+
+        candidates = list(self.getHomeBoundaryPoints(gameState))
+        candidates.extend(
+            cap for cap in self.getCapsulesYouAreDefending(gameState)
+            if self.isLegalPosition(gameState, cap)
+        )
+        # Exits and prizes we can reach no later than the invader can
+        cutoffs = [
+            pos for pos in dict.fromkeys(candidates)
+            if self.getMazeDistance(myPos, pos) <= self.getMazeDistance(invader, pos)
+        ]
+        if not cutoffs:
+            return None
+        return min(cutoffs, key=lambda pos: self.getMazeDistance(invader, pos))
+
+    def getScaredShadowTargets(self, gameState: GameState, invaders: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        myPos = gameState.getAgentPosition(self.index)
+        if myPos is None or not invaders:
+            return []
+        myPos = nearestPoint(myPos)
+        invader = min(invaders, key=lambda inv: self.getMazeDistance(myPos, inv))
+
+        # Cells on our side 2-3 maze steps from the invader (BFS ring)
+        walls = gameState.getWalls()
+        boundaryX = walls.width // 2 - 1 if self.red else walls.width // 2
+        frontier = [(invader, 0)]
+        seen = {invader}
+        ring = []
+        while frontier:
+            pos, depth = frontier.pop(0)
+            if 2 <= depth <= 3:
+                onOurSide = pos[0] <= boundaryX if self.red else pos[0] >= boundaryX
+                if onOurSide:
+                    ring.append(pos)
+            if depth >= 3:
+                continue
+            for action in self.getLegalSearchActions(gameState, pos):
+                nextPos = nearestPoint(Actions.getSuccessor(pos, action))
+                if nextPos not in seen:
+                    seen.add(nextPos)
+                    frontier.append((nextPos, depth + 1))
+        return sorted(ring, key=lambda pos: self.getMazeDistance(myPos, pos))[:3]
 
     def getAntiOscillationTargets(self, gameState: GameState) -> List[Tuple[int, int]]:
         myPos = gameState.getAgentPosition(self.index)
@@ -769,7 +992,39 @@ class MixedAgent(CaptureAgent):
             target for target in ranked
             if self.getGhostTargetPenalty(gameState, target) < 80
         ]
-        return (safest or ranked)[:1]
+        homeTargets = (safest or ranked)[:1]
+        # Phase 13.2: chased with a capsule nearby -> grab the capsule instead of
+        # running for the line; once eaten the chaser stops being dangerous and
+        # the scared-window logic can take over.
+        if self.capsuleDetourEnabled and homeTargets:
+            detour = self.getCapsuleDetourTarget(gameState, homeTargets[0])
+            if detour is not None:
+                return [detour]
+        return homeTargets
+
+    def getCapsuleDetourTarget(self, gameState: GameState, homeTarget: Tuple[int, int]):
+        agentState = gameState.getAgentState(self.index)
+        myPos = agentState.getPosition()
+        if myPos is None or not agentState.isPacman:
+            return None
+        myPos = nearestPoint(myPos)
+
+        dangerousGhosts = self.getVisibleDangerousGhosts(gameState)
+        if not dangerousGhosts or self.distanceToClosestTarget(myPos, dangerousGhosts) > CLOSE_DISTANCE + 1:
+            return None
+
+        capsules = [cap for cap in self.getCapsules(gameState) if self.isLegalPosition(gameState, cap)]
+        if not capsules:
+            return None
+        capsule = min(capsules, key=lambda cap: self.getMazeDistance(myPos, cap))
+        capsuleDistance = self.getMazeDistance(myPos, capsule)
+        if capsuleDistance > min(self.getMazeDistance(myPos, homeTarget), 6):
+            return None
+        if self.getGhostTargetPenalty(gameState, capsule) >= 80:
+            return None
+        if self.defDiagnostics:
+            self.defDiagCounts["capsuleDetours"] += 1
+        return capsule
 
     def getHomeTargetScore(self, gameState: GameState, target: Tuple[int, int]) -> float:
         myPos = gameState.getAgentPosition(self.index)
@@ -1107,6 +1362,14 @@ class MixedAgent(CaptureAgent):
             elif mode == "go_home" and ghostDistance <= 2 and self.isChokepoint(gameState, nextPos):
                 stepCost += 8
 
+        # Phase 13.3: a scared defender pays heavily for stepping next to an invader
+        # (same magnitude as the ghost-adjacent penalty on the attack side).
+        if self.scaredDefenceEnabled and mode in ("defence", "patrol"):
+            if gameState.getAgentState(self.index).scaredTimer > 0:
+                invaders = self.getVisibleInvaders(gameState)
+                if invaders and self.distanceToClosestTarget(nextPos, invaders) <= 1:
+                    stepCost += 35
+
         stepCost += self.getTeammateStepConflictPenalty(gameState, nextPos)
         stepCost += self.getRecentPositionPenalty(nextPos, mode)
 
@@ -1201,6 +1464,31 @@ class MixedAgent(CaptureAgent):
         if carrying > 0:
             distHome = self.distanceToClosestTarget(nextPos, context["homePoints"]) + 1
             q += w.get("chance-return-food", 0) * carrying * (1 - distHome / (walls.width + walls.height))
+
+        # Phase 12.2a: binary home-cut-risk event, hand-set weight (see registerInitialState).
+        # Fires when carrying and a ghost can reach every home boundary point no later
+        # than +1 of us, i.e. all escape routes are compromised; 91% of its firings are
+        # outside the hard ghost-penalty radius of getSearchStepCost (diagnostic, n=10).
+        if self.qlPathRiskWeight and ghosts and carrying > 0 and bestMargin <= 1:
+            q += self.qlPathRiskWeight
+
+        # Phase 12.2 pre-diagnostic: count candidate binary risk events on the cells the
+        # attack search actually evaluates (both candidates need a visible ghost, so the
+        # denominator is ghost-present evaluations). hard = the cell already pays the
+        # 3~100 ghost penalty in getSearchStepCost, i.e. the QL term would be redundant.
+        if self.qlRiskDiag and ghosts:
+            counts = self.riskDiagCounts
+            counts["evals"] += 1
+            hard = ghostDist <= CLOSE_DISTANCE
+            if carrying > 0 and bestMargin <= 1:
+                counts["homecut"] += 1
+                if hard:
+                    counts["homecut_hard"] += 1
+            depth = self.tunnelDepth.get(nextPos, 0)
+            if depth > 0 and ghostDist <= 2 * depth + 2:
+                counts["tunnelghost"] += 1
+                if hard:
+                    counts["tunnelghost_hard"] += 1
 
         cache[nextPos] = q
         return q

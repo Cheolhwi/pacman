@@ -443,3 +443,145 @@ defaultCapture 比分呈 1/11 双峰（差 1 局均分变 0.5），n=10 的 ±2 
 - 修正后的最终叙事：QL-guided A* 的真实收益在窄道图（blox +7.0 → +9.0），default/strategic 中性，随机图泛化无损。保留的 QL 信号（ghost 邻近、dead-end、revisit、带豆回家拉力）构成一个**风险感知 tie-breaker**；被剔除的 `eats-food` 证明"学到的最大权重 ≠ 对路径规划最有用的信号"。
 - 对报告的价值：Phase 9（确诊方法）→ 10.1（角色反转）→ 10.2（结构特征毒化）→ 11（消融定位单一元凶 + 大样本证伪噪声收益）构成完整闭环；11 的消融矩阵 + n=50 复测是其中统计上最干净的一环。
 - 副作用已还原：`score` 已 checkout，权重文件与 ckpt6 逐位一致（diff 验证），仓内备份已移出。快照与全部运行日志在 /tmp/qlweights_phase11_ckpt6_snapshot.txt、/tmp/p11_*.log（重启后丢失）。
+
+---
+
+日期：2026-06-13（Phase 12）
+
+目标：按 PLAN.md Phase 12，在 QL = risk-aware tie-breaker 定位不变的前提下，回答"当前风险信号是刚刚好还是太弱"。基线 = Phase 11 终态（commit 09a2652），全程不训练、不动 ckpt6 权重。
+
+### 12.1 λ 小扫描
+
+实现：新增 `QL_PATH_LAMBDA` 环境变量覆盖 `qlPathLambda`（默认不设时行为逐位不变），沿用 `QL_PATH_ABLATE` 的事故面控制思路；已验证透过 `conda run` 生效、不设时无副作用。
+
+smoke（bloxCapture 正向 ×10）与复测：
+
+| λ | blox ×10 | blox ×30 | 判定 |
+| --- | --- | --- | --- |
+| 0.03 基线 | +8.6 | **+9.13**（30/30） | 同日对照 |
+| 0.01 | +8.2 | — | 与基线不可区分 |
+| 0.02 | **+4.9（3 平局）** | 复跑 ×10：**+3.5（5 平局）** | **可复现病态** |
+| 0.05 | +9.8 | **+9.13**（30/30，与基线同均分） | 不可区分 |
+
+- default ×20 @ λ=0.05：+7.5（与 Phase 11 持平，中性）。
+- **结论：保持 λ=0.03（无改动默认胜出），未跑 RANDOM23（无采纳候选）。**
+- 重要副产物：**λ=0.02 在 blox 上可复现地诱发 0-0 平局（两轮合计 8/20 局）**。机制（-q 诊断局）：终盘双 agent 长期处于 attack 模式（178 回合）但在己方半场绕环不过界——tie-break 强度在特定值附近会把兄弟动作排序扭成活锁环路。λ 响应**非单调**（0.01 好、0.02 坏、0.03/0.05 好），实锤 λ 不是可自由微调的旋钮，0.03 是已验证的安全点。
+
+### 12.2 二值风险特征：前置诊断
+
+实现：`QL_PATH_RISK_DIAG=1` 只读计数器（`getQLPathValue` 内统计、`final()` 打印 QL-RISK-DIAG 行），统计候选事件触发率与"hard penalty（`getSearchStepCost` 的 3~100 量级 ghost 惩罚）同格触发"重叠率。
+
+| 候选 | blox 触发率 | RANDOM 触发率 | RANDOM hard 重叠 | 判定（规则：<1% 或重叠>90% 弃） |
+| --- | --- | --- | --- | --- |
+| tunnel-with-ghost-risk（tunnelDepth>0 且 ghostDist≤2·depth+2） | 0.06% | 0.22% | 56% | **触发率不足，弃** |
+| home-cut-risk（carrying>0 且所有 boundary 安全余量 ≤1） | 0.12% | **2.7%** | **仅 9%** | 通过，进 12.2a |
+
+home-cut-risk 触发集中在带豆深入局（单局最高 205 次），且 91% 触发在 hard penalty 半径外——形式上正是想要的增量信息。
+
+### 12.2a home-cut-risk 手设权重 A/B（最终弃）
+
+实现：`QL_PATH_RISK_W` 环境变量（默认 0 = 行为逐位不变），事件触发时给 q 加该权重。
+
+- **第一轮 w=-2（对齐 dead-end 量级）：无效测量。** RANDOM23 ×49 on/off **逐局比分完全相同**（diff 验证）。原因是尺度错配：-2 经 λ=0.03 折算仅 +0.06 步代价，且 RANDOM23 系列图上每局完全确定（同图重跑计数逐位一致），微扰不足以翻转任何排序。
+- **第二轮 w=-30（0.03×30=0.9，cap 饱和，唯一一次尺度修正，不扫档）：仍然零效应。** RANDOM23 ×49 逐局比分仍与 off 完全相同；blox ×30 = +9.0（vs 基线 +9.13，持平）；default ×20 = +6.0（vs +7.5，双峰噪声内偏负）。
+- **判定：弃。** 即使把单个二值事件打到 cap 上限，验收图集上 A* 的决策没有一次被改变——被标记格子从不出现在"代价差 < cap 的竞争分支"上。
+
+### Phase 12 总结论
+
+- **保持 Phase 11 配置不变提交**：`qlGuidedAStar=True`、λ=0.03、cap=1.0、ckpt6 权重；12.1/12.2 的全部改动只留下三个默认无副作用的实验旋钮（`QL_PATH_LAMBDA` / `QL_PATH_RISK_DIAG` / `QL_PATH_RISK_W`）。
+- 最终 flag-off 回归：blox ×10 = +8.2（10/10）、default ×10 = +5.0（10/10，双峰 n=10 噪声内），行为无恙。
+- **正面叙事：风险信号栈已饱和。** 两条独立证据互证——(1) λ 在 ±60% 范围内（0.01~0.05）对 blox/default 无可测影响；(2) 一个语义合理、触发率合格、与 hard penalty 重叠仅 9% 的新二值风险信号，即使权重打满 cap 也无法改变验收图集上的任何决策。Phase 11 配置是 cap=1.0 框架内的局部最优，廉价增改没有收益空间。
+- **负面警示：λ=0.02 活锁。** tie-break 信号不是单调旋钮，存在能诱发 0-0 活锁的刀锋区；这反过来支持"不再加强 QL 信号"的收尾决策。
+- 12.3（路径段风险）触发条件不满足（λ 加大无收益、新特征无效应不是"延迟暴露"问题而是"决策不敏感"问题），按计划跳过。
+- 副作用：`score` 已 checkout 还原；`QLWeightsMyTeam.txt` 全程未动（git status 验证）；运行日志在 /tmp/p12_*.log（重启后丢失）。
+
+### Phase 12 附加：方向 1 对手多样性复测（零代码改动）
+
+动机：Phase 12 的"风险信号饱和"结论全部条件于 staffTeam；用仓库现成的其他对手检验其可迁移性。flag-off 用 `QL_PATH_LAMBDA=0` 实现（短路 `qlPathLambda > 0` 守卫，与纯 HS 等价）。
+
+对手盘点：`wise.py` 与 `berkeleyTeam.py` 逐位相同（弃用）；有效对手为 berkeleyTeam（1 攻 1 守反射式）与 bravo（双攻反射式，制造 staffTeam 评估未覆盖的双入侵局面）。
+
+| 对手 | 图 | QL off | QL on | 判定 |
+| --- | --- | --- | --- | --- |
+| berkeley | blox ×10 | +11.9（10/10） | +12.5（10/10） | 噪声内中性 |
+| berkeley | RANDOM23 ×25 | +11.44（25/25） | +11.08（25/25） | 噪声内中性 |
+| bravo | blox ×10 | +10.2（10/10） | +7.4（9/10，一败） | 疑似信号 → 复测 |
+| bravo | blox ×30 复测 | **+11.50（30/30）** | **+11.53（30/30）** | **n=10 信号被证伪，完全中性** |
+| bravo | RANDOM23 ×25 | +11.56（25/25） | +11.56（25/25） | 逐局不同、均值巧合相同，中性 |
+
+结论：
+
+- **QL on/off 对 berkeley/bravo 全部中性，饱和结论在可得对手上可迁移**；n=10 出现的 -2.8 + 首败再次验证了小样本纪律（bravo 带随机 tie-break，单局分差 1~17，方差远大于 staffTeam，n=10 不可用）。
+- 方法论限制（诚实记录）：repo 内全部对手（staff/berkeley/bravo）都被轻松碾压（除一局噪声败局外全胜，均分 +9~+12），没有任何对手能把比分压进"QL 项可能起作用的竞争区间"。**"重训对齐特征子集"与"目标层风险 tie-break"两个候选方向在本地缺乏能检验它们的尺子，留待真实比赛对手出现后再立项。**
+- QL 线在本地评估体系内正式收官：Phase 7-9（QL 作为策略失败）→ 10-11（QL 作为风险 tie-breaker 成功）→ 12（通道饱和证明 + 对手迁移性验证）。
+- 副作用：本轮零代码改动；`score` 已还原。日志在 /tmp/p12_d1_*.log、/tmp/p12_bravo30_*.log。
+
+## Phase 13: 防守策略与 capsule 时机（HS 层首次系统优化）
+
+日期：2026-06-13
+
+目标：按 PLAN.md Phase 13，对从未走过验收矩阵的两层——防守策略与 capsule 时机——做先测量、后改动的系统实验。全部改动 env 门控（默认 off 行为逐位不变），以 Phase 11 终态（commit 09a2652）为回退点。
+
+### 13.0 防守诊断计数器与基线触发率
+
+实现：`HS_DEF_DIAG=1` 只读计数器（`updateDefenceDiagnostics`，`final()` 打印 DEF-DIAG 行），统计 foodLost / capsuleLost / invaderSteps / scaredChaseSteps / chaseSteps / chaseNoGain / scaredWindowSteps / scaredWindowFood / safeWindowSteps / capsuleDetours。
+
+基线测量（bravo + staffTeam × blox/default，各 ×5，`-q`）：
+
+| 病灶 | 证据 | 判定 |
+| --- | --- | --- |
+| C1 scared 窗口浪费 | staff default 高分局：窗口 39 步只吃 4-6 颗（3 颗即回家） | 触发合格，进 13.1 |
+| C2 capsule detour | 计数器测不到，按 Phase 6 遗留 backlog 直接做 | 进 13.2 |
+| D1 scared 追击 | 25 局仅 1 局 5 步（capsuleLost 仅 2/10 bravo 局） | 触发率低，降级实现 |
+| D2 追而不获 | staff blox：chaseNoGain 13/18（70%）且每局丢 7 颗；bravo blox ~50% | 证据最强，进 13.4 |
+| D3 capsule 卡位 | capsuleLost 2/10 | 触发率低，弃 |
+
+### 实现（全部保留在代码中，默认 off）
+
+- `HS_SCARED_WINDOW`（13.1）：对手 scared 期间 `shouldReturnHome` 的 carrying 阈值 3→8、跳过领先早退。窗口判定第一版用 min(scaredTimer) 几乎不触发（safeWindowSteps 3/39，防守吃掉 invader 即归零），改为 max(scaredTimer) > 回家距离+8 且附近无清醒危险 ghost。
+- `HS_CAPSULE_DETOUR`（13.2）：ghost 压力触发回家时，若敌方半场 capsule 距离 ≤ min(回家距离, 6) 且未被把守，go_home 目标改为 capsule。
+- `HS_SCARED_DEF`（13.3）：自身 scared 时防守目标改为距 invader 2-3 格的 shadowing 环（BFS），A* 对 invader 相邻格 +35 代价。
+- `HS_INTERCEPT`（13.4）：追击连续 3 步无进展时，目标改为「我能不晚于 invader 到达的出口/capsule 中离它最近者」。
+
+### 关键机制发现：scared ghost 之死是免费的
+
+capture.py 核对（`checkDeath`，line ~682-725）：scared ghost 被 Pacman 碰撞后回出生点且 **scaredTimer 立即归零**，`KILL_POINTS = 0` 无分数代价。因此基线"自杀式追击"实为最优——以一次重生路程的代价解除 40 步 debuff；任何"scared 自保"都让防守端白白瘫痪 40 步。13.3 的设计前提被游戏规则直接证伪。
+
+### 固定种子 A/B（`-f`，defaultCapture vs bravo，同一种子）
+
+| 配置 | 结果 |
+| --- | --- |
+| flag-off | 红队 +8 |
+| HS_CAPSULE_DETOUR | 红队 +8（未触发，逐位同 flag-off） |
+| HS_SCARED_DEF | **被提前判负（对方回满 18 颗）** |
+| HS_INTERCEPT | **被提前判负** |
+
+### 批量 A/B（同日对照，n 见表）
+
+| 测试 | flag-on | 同日 flag-off | 判定 |
+| --- | --- | --- | --- |
+| 13.3 bravo default ×5 | +5.2（4/5，有 -10） | +10.4 | **弃** |
+| 13.3 bravo blox ×5 | +3.8（4/5，有 -24） | +12.0 | **弃** |
+| 13.4 bravo default ×5 | **-2.2（2/5 胜）** | +10.4 | **弃** |
+| 13.4 bravo blox ×5 | **-3.8（3/5 胜）** | +12.0 | **弃** |
+| 13.1 staff default ×30 | **+4.6**（高分局 12/30，且全为 10 分） | **+7.67**（高分局 20/30，全为 11 分） | **弃**（~2.9σ） |
+| 13.2 staff default ×30 | +7.0（18/60 agent-局触发） | +7.67 | 中性，不启用 |
+| 13.2 staff blox ×30 | +8.2（**0/60 触发**，等价又一份 flag-off 样本） | +9.13 | 标定双峰噪声幅度（n=30 同配置 ±0.9） |
+
+13.1 失败机制：窗口用 max(scaredTimer) 判定，但杀手是已苏醒重生的那只 ghost——收割越深，它越有时间回防在边界截杀，把 11 分局打成 1 分局（高分局率 67%→40%）；幸存的高分局也因晚回家少交 1 颗（11→10）。而 min 规则因"防守吃 invader 即归零"永不触发——该特性在两种判定下分别为有害/无效，无中间档。
+
+13.4 失败机制：边界开口多，蹲守"离 invader 最近的出口"时它在别处自由吃豆；贴身追击虽然追不上，但持续驱赶使其无法安心吃豆——压迫本身就是防守。蹲点/追击在距离缩短时还会互相翻转，最坏两头空。
+
+### 验收与收尾
+
+- flag-off 逐位等价：`-f` 固定种子 default/blox 各 1 局，与 git stash 还原的 HEAD（Phase 11 终态）输出 **diff 完全一致**。
+- `-c` 计时 ×5：5/5 胜，+7.0，无超时（新增 per-step 计算不影响时限）。
+- 同日 flag-off n=30 对照本身即本轮回归：default 30/30 胜 +7.67、blox 30/30 胜 +9.13。
+- **提交配置不变**：`qlGuidedAStar=True`、λ=0.03、ckpt6；新增 5 个默认无副作用旋钮（`HS_DEF_DIAG` / `HS_SCARED_WINDOW` / `HS_CAPSULE_DETOUR` / `HS_SCARED_DEF` / `HS_INTERCEPT`）。
+- `score` 已还原；日志在 /tmp/p13_*.log（重启后丢失）。
+
+### 结论
+
+- **四个候选全部不采纳**：两个防守特性被机制级证伪（scared 之死免费 + 压迫即防守），scared 窗口在双峰图上显著有害，capsule detour 中性。本地评估体系内，Phase 4 的简单防守（贴身追击 + 失窃点调查）+ 现有 capsule 用法已是局部最优。
+- 与 Phase 12 的"风险信号饱和"互为印证：HS 规则层和 QL 引导层在本地对手上都已无廉价收益空间；真正的改进空间只能由更强的真实比赛对手暴露。
+- 对报告的价值：13.0 的测量先行方法 + 13.3 的"游戏机制证伪设计直觉"（scared 自保反而有害）+ 13.4 的"追而不获仍优于蹲点"是三个干净的否定性实验；本轮零回归风险（逐位等价验证）。

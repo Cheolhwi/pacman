@@ -578,6 +578,194 @@ Phase 6 结论：
 - 工具沉淀：`QL_PATH_ABLATE` 环境变量消融开关保留在代码中（默认空集、零行为影响），避免了批间翻转文件 flag 的事故面。
 - 提交 flags：`trainning=False`、`qlLowLevelModes=set()`、`qlDiagnostics=False`、`qlGuidedAStar=True`（首次默认启用）；ckpt6 权重未动。
 
+## Phase 12: QL Risk Residual Refinement（风险残差精化）
+
+背景与定位：
+
+- Phase 11 已把 QL 的角色定死：**风险感知 tie-breaker**——A* 负责全局路径，HS/PDDL 负责目标选择，QL 只在兄弟动作间回答"哪条路更危险"，不回答"该不该吃这颗豆"。本阶段不再动这个定位，只回答一个问题：**当前风险信号是"刚刚好"还是"太弱"？能否在不伤随机图 49/49 的前提下，把风险判断质量再提一档？**
+- 关键代码事实（设计前提，已核对 ckpt6）：`QLWeightsMyTeam.txt` 里**没有** `home-path-margin` / `tunnel-depth` 的权重条目，`getQLPathValue` 中这两段是恒为 0 的死路径。当前实际生效的信号只有 6 个：`eats-capsule`(+6.06)、`#-of-ghosts-1-step-away`(-4.98)、`ghost-distance`(-0.24, 归一化后量级很小)、`dead-end`(-2.01)、`revisit`(-1.69)、`chance-return-food`(+13.59×carrying×归一化回家进度)。
+- 推论：任何新风险特征都**不可能从 ckpt6 白拿权重**。推理侧加入 = 手设权重的 shaped risk prior（不是学到的 Q）；要学权重就必须续训。这个区别在每个子阶段里都要诚实标注，不能混淆叙事。
+- 预期管理：Phase 11 配置已具备提交资格，本阶段是提交前 refinement，收益预期为小幅；**Phase 11 状态始终是回退点**，任何一步失败直接回退，不抢救。若 12.1/12.2 全部中性，Phase 12 以"现有风险信号已饱和"的否定性结论收尾——对报告同样有价值。
+
+### Phase 12.0: 基线封存与死代码清理（不跑新实验）
+
+- 把 Phase 11 终态打 git tag（或记录 commit hash）作为本阶段唯一对照基线，封存基线数字：blox 正向 +9.0 / 反向 +8.2、default +7.5 / +12.0（n=20）、strategic +6.1、RANDOM23 49/49 +9.47、RANDOM42 49/49 +9.94。
+- 报告叙事统一更名：不再叫 hybrid QL，不再说"QL 替代低层"，统一为 "QL = risk-aware tie-breaker for A*"。
+- 可选清理：`getQLPathValue` / `buildQLPathContext` 里 `home-path-margin` 的计算（每个 boundary point 一次 `getMazeDistance`）在 ckpt6 下纯属浪费算力，可加 `weight != 0` 守卫或直接删除；改完跑 flag-on defaultCapture ×3 确认逐位等价（权重为 0，行为不应有任何变化）。此项不强制，但若做 12.3（需要重搜预算）建议先做。
+
+### Phase 12.1: λ 小扫描（最轻，先做）
+
+当前 `qlPathLambda = 0.03`、`qlPathCap = 1.0`。Phase 11 剔除 `eats-food` 后 QL 项的毒性已大幅降低，值得确认 0.03 是不是仍然最优。
+
+- 实现：仿照 `QL_PATH_ABLATE` 加环境变量 `QL_PATH_LAMBDA` 覆盖（默认不设时行为逐位不变），杜绝批间翻文件 flag 的事故面。
+- 扫描：λ ∈ {0.01, 0.02, 0.05}，cap 固定 1.0，**不动任何其他参数**。
+- 回答三个问题（不是找最高均分）：λ 变小后 blox +9.0 是否保得住（信号是否本来就在起作用）；λ 变大后 RANDOM23 是否仍 49/49（信号还能不能更强）；default 是否仍只是中性波动。
+- 流程：每档先 blox 正向 ×10 smoke（只筛明显坏配置，均分差 < 2 不算信号）；幸存档跑 blox n=30~50 + default n≥20；唯一候选档在采纳前必须过 RANDOM23 ×49 = 49/49。
+- 决策：0.05 无损随机图且 blox 不低于 +9.0 → 说明 tie-breaker 还有加强空间，采纳 0.05 并为 12.2 留出解释（信号偏弱）；任何档与 0.03 不可区分 → **保持 0.03（无改动默认胜出）**；0.05 伤随机图 → 实锤"当前强度刚刚好"，记录后进入 12.2。
+
+### Phase 12.2: 二值风险事件特征（最多 2 个，推理侧先行，一次只加一个）
+
+Phase 10.2 的教训：连续结构特征（`home-path-margin`、`tunnel-depth`）训练后符号被回报相关性污染——food 常在深处/窄道，线性 QL 把危险结构学成好结构。本阶段改用**二值风险事件**：更粗糙，但符号不易学反（Phase 9 中二值的 `moves-toward-food` 比原始距离特征鲁棒，是同一先验）。
+
+候选（按优先级，第 3 个仅在前两个都失败时考虑）：
+
+1. **`home-cut-risk`**：carrying > 0 且 `max_b (ghostBoundaryDist[b] - myDist(nextPos, b)) <= 1` → 1。语义：所有回家出口的安全余量都被压到 ≤1，即 ghost 能在任何 boundary 截住我。本质是 `home-path-margin` 的二值化，**直接复用 `buildQLPathContext` 现成的 `ghostBoundaryDist` 预计算，零新增基础设施**。
+2. **`tunnel-with-ghost-risk`**：`tunnelDepth[nextPos] > 0` 且可见 ghost 距该位置 ≤ CLOSE_DISTANCE → 1。语义：ghost 在附近时进入单出口走廊体系。复用 `computeTunnelDepthMap` 静态预计算。
+3. `revisit-under-pressure`（备选）：nextPos ∈ recentSet 且（ghost 可见或 carrying > 0）→ 1。与现有 `revisit` 重叠度高，预期增量最小。
+
+权重来源（诚实分两步，不混叙事）：
+
+- **12.2a 推理侧手设权重**：量级对齐现有风险信号（参考 `dead-end` ≈ -2，初值取 -2，不扫多档），用 `QL_PATH_ABLATE` 同款环境变量开关做 A/B。明确标注：这是 shaped risk prior，不是学到的 Q——报告里如此陈述。
+- **12.2b 轻量续训学权重（仅当 12.2a 显著有效才触发）**：把胜出特征加进 `getOffensiveFeatures` 续训，teacher floor 不低于 0.3（Phase 9 教训：floor=0.1 时自走经验被边界僵局污染毒化权重）、训练前快照权重、每轮存 checkpoint、训练分布 = RANDOM 为主 + 固定图少量混入、每轮只看一个主指标。**验收唯一标准：学出的符号必须为负且续训后整个验收矩阵不低于 12.2a 手设版**；学反了就回退手设版，不二次抢救。
+
+前置诊断（先做，避免做冗余功）：
+
+- `getSearchStepCost` 已有 ghost 距离 3~100 量级的 hard penalty + chokepoint 惩罚，碾压 cap=1.0 的 QL 项。新特征必须证明在 **hard penalty 未触发的区间**（ghost 距离 > CLOSE_DISTANCE、或 margin 将塌未塌时）提供增量信息。
+- 方法：先加 diagnostic counter（`qlDiagnostics` 通道）统计每个候选特征在 blox / RANDOM23 上的触发率，以及"触发时 hard penalty 是否同时触发"的重叠率。触发率 < 1% 或重叠率 > 90% 的特征直接弃，不进 A/B。
+
+验收（每个特征独立过关）：blox 正向 n=30 不低于 +9.0、default n≥20 中性、RANDOM23 ×49 = 49/49。任何特征伤随机图 → 直接弃，**不调权重抢救**（避免引入新调参维度）。
+
+### Phase 12.3: 路径段风险评估（条件触发，最具研究味，默认不做）
+
+动机：Pacman 的风险常在几步之后才暴露（过界后被两鬼合围、进窄道后无回头路、带豆深入回不来），单步 Q 值看不到。这是"step-level → segment-level risk"的叙事升级。
+
+**触发条件（满足其一才立项，否则跳过）**：12.1 显示 λ 加大有收益但被随机图卡死（信号强度到顶、需要换粒度）；或 12.2 的特征在"延迟暴露型风险"场景（blox 反向、带豆深入局）仍然无效。
+
+机制草图（保持 QL 不改目标的铁律）：
+
+```text
+attack A* 返回路径后，对前 K=3~5 步累加 getQLPathValue（已 memoized，近零开销）；
+段风险超阈值 → 对该路径首条边加一次性 surcharge，重搜一次（最多 1 次，硬上限）；
+重搜结果仍指向同一 HS 目标，只是换入口/换路线。
+```
+
+- 约束：重搜增加算力，`-c` 计时 ×10 无超时是硬验收；K 与阈值各只取一个先验值，不做二维扫描；flag off 时逐位等价。
+- 验收：同 12.2 矩阵 + `-c` 计时。失败直接回退，不迭代第二版——这是提交前阶段，不是研究阶段。
+
+### Phase 12.4: 统计与验收纪律（全阶段共用，源自 11 的双峰教训）
+
+- **n=10 只当 smoke test**：只用于筛掉明显坏配置；defaultCapture 是 1/11 双峰分布，n=10 均分差 < 2 一律视为噪声，不得写入结论。
+- 采纳任何改动前：固定图 n=30~50 复测；**RANDOM23 优先于 RANDOM42**（历史上只有 RANDOM23 暴露过泛化失败），必须 49/49。
+- 全部对照使用同日同机基线；每轮只动一个变量；批间配置一律走环境变量，不翻文件 flag。
+- 跑任何训练相关命令前快照 `QLWeightsMyTeam.txt`；诊断局 `-q`，批量评估 `-Q`。
+
+### 明确不做（负面清单，比做什么更重要）
+
+- 不再尝试纯 QL 或 attack/go_home hybrid 作为主策略（Phase 7/8/9 已三次证伪，RANDOM23 24/49 是定论）。
+- 不把 QL 接到 defence / patrol / go_home（escape 权重病态结论不变：`distanceToHome` +352 / `stop` +7.6）。
+- 不把任何"目标拉力"特征放回 path adapter：`eats-food`、`closest-food`、`moves-toward-food` 及一切"更想吃附近豆"的信号属于目标选择层，不属于路径风险层（Phase 11 定论）。
+- 不再训练原始连续结构特征（`home-path-margin` / `tunnel-depth` 是 10.2 反例：语义合理但线性 QL 学反符号）。
+- 不上 neural network / experience replay / n-step return——收益与解释成本不匹配，违背"不过度工程化"约束。
+- 不做盲训（"训 200 局看看"）；若 12.2b 触发续训，teacher floor ≥ 0.3 + checkpoint 纪律是硬约束。
+
+### 执行顺序与终止条件
+
+```text
+12.0 封存基线（半小时级）
+  → 12.1 λ 扫描（轻，1 个变量）
+  → 12.2 二值风险特征（先诊断触发率，再 12.2a 手设，显著有效才 12.2b 续训）
+  → 12.3 仅在触发条件满足时立项
+任何一步失败 → 回退 Phase 11 配置（它已具备提交资格），该步记为否定性结果。
+```
+
+一句话总纲：**接下来的 QL 不追求"更会吃豆"，只追求"更会判断哪条 A* 路线风险小"——把风险信号做得更干净、更稳，且每一步都以 Phase 11 验收矩阵为不可退化底线。**
+
+本轮 Phase 12 实验结果（详见 record.md 2026-06-13 Phase 12）：
+
+- **12.1 λ 扫描：保持 0.03（无改动默认胜出）。** 0.05 与 0.03 在 blox ×30 上均分完全相同（+9.13），default 中性；0.01 与基线不可区分。重要副产物：**λ=0.02 可复现地诱发 blox 0-0 活锁（8/20 局）**——终盘双 agent 困在 attack 模式于己方半场绕环不过界。λ 响应非单调，存在刀锋区，λ 不是可自由微调的旋钮。
+- **12.2 前置诊断按规则筛掉 tunnel-with-ghost-risk**（触发率 0.06%~0.22% < 1%）；home-cut-risk 通过（RANDOM 2.7%，hard penalty 重叠仅 9%）进入 12.2a。
+- **12.2a home-cut-risk 最终弃**：w=-2 是无效测量（经 λ 折算仅 0.06 步代价，RANDOM23 ×49 逐局比分与 off 完全相同）；唯一一次尺度修正 w=-30（cap 饱和）后 RANDOM23 ×49 **仍然逐局相同**，blox/default 持平——被标记格子从不落在"代价差 < cap 的竞争分支"上。
+- **12.3 触发条件不满足，按计划跳过**：问题不是"单步看不到延迟风险"，而是"验收图集上的决策对 QL 项扰动不敏感"，换粒度走同一个 capped 通道无法绕过。
+- **总结论（正面叙事）：风险信号栈已饱和。** λ ±60% 无可测影响 + 语义合理/触发合格/重叠仅 9% 的新二值信号打满 cap 仍零决策改变，两条独立证据互证 Phase 11 配置是 cap=1.0 框架内的局部最优。提交配置不变：`qlGuidedAStar=True`、λ=0.03、cap=1.0、ckpt6。
+- 工具沉淀：`QL_PATH_LAMBDA`、`QL_PATH_RISK_DIAG`、`QL_PATH_RISK_W` 三个环境变量旋钮保留（默认全部无副作用，flag-off 回归通过）；`score` 已还原，权重文件全程未动。
+- **附加（方向 1）对手多样性复测**：QL on/off 对 berkeleyTeam 与 bravo（双攻型）在 blox/RANDOM23 上全部中性（bravo blox n=10 的 -2.8 + 首败被 n=30 证伪为噪声——bravo 带随机 tie-break，单局方差远大于 staffTeam）。饱和结论在可得对手上可迁移；但 repo 内所有对手均被碾压（+9~+12 全胜），"重训对齐特征子集"与"目标层风险 tie-break"在本地没有能检验它们的尺子，留待真实比赛对手。**QL 线在本地评估体系内正式收官。**
+
+## Phase 13: 防守策略与 capsule 时机（HS 层首次系统优化）
+
+背景与定位：
+
+- Phase 4 之后防守/巡逻层只在 bloxCapture 收敛实验中动过协作分工，从未走过 Phase 6 式的 A/B 验收矩阵；capsule 在进攻里只是"ghost 压力下的备选目标"，从未有"时机"概念。QL 线已收官（Phase 12），本阶段回到 HS 规则层，优化这两个未被系统优化过的层。
+- 代码现状核对（设计前提）：
+  - `getDefenceTargets()` 看到 invader 直接以其当前位置为目标追击；全文件没有任何地方读 `gameState.getAgentState(self.index).scaredTimer`——**我方被 capsule 反制变 scared 后会径直撞上 invader 送死**。
+  - defence 同速追击从背后永远追不上（staffTeam 弱进攻掩盖了这点，bravo 双攻能暴露）。
+  - 我方 capsule 只是 defence 目标列表里排在 `lastEatenFood` 之后的普通一项，没有"invader 逼近 capsule 时优先卡位"的逻辑。
+  - `shouldReturnHome()` 的 `carrying >= 3` 与 `score >= 5 且 carrying > 0` 两个触发完全无视对手 scaredTimer——吃下 capsule 后的收割窗口被白白浪费（`getVisibleDangerousGhosts` 已排除 scared ghost，所以 ghost 触发天然关闭，但上述两个触发照样把 agent 拉回家）。
+  - Phase 6 遗留 backlog"有 capsule 且 ghost 威胁近时，允许先转 capsule 再回家"**从未实现**：`shouldReturnHome` 在 `getEffectiveLowLevelMode` 里优先级最高，ghost 近 + 带豆时直接 go_home，哪怕 capsule 就在 1~2 格外。
+- 测量尺子问题（继承 Phase 12 结论）：本地对手全被碾压，胜率指标已饱和，改进只能体现在**均分**与**只读防守计数器**上；防守类改动用 bravo（双攻反射式，制造真实双入侵压力）做主要对照对手，capsule 时机类用 staffTeam 标准矩阵。
+- 回退点：Phase 11 终态（`qlGuidedAStar=True`、λ=0.03、ckpt6）。任何一步失败直接回退，不抢救。
+
+### Phase 13.0: 防守诊断计数器（只读，先建尺子）
+
+- 仿照 `qlDiagnostics` 加 `defDiagnostics` 只读计数器，`final()` 打印一行（`-q` 可见）：
+  - `foodLost`：终局防守 food 数相对开局的减少量；
+  - `capsuleLost`：我方 capsule 被吃次数；
+  - `invaderSteps`：可见 invader 处于我方半场的累计步数；
+  - `scaredChaseSteps`：自身 scaredTimer > 0 且与可见 invader 距离 ≤ 2 的步数（D1 病灶直接测量）；
+  - `scaredWindowSteps` / `scaredWindowFood`：对手 scaredTimer > 0 期间的步数与吃豆数（C1 病灶直接测量）。
+- 用 bravo + staffTeam 各跑 blox/default ×5（`-q`）拿基线读数，确认各病灶在本地对手上的真实触发频率——**触发率太低的项直接降级不做**（Phase 12.2 的教训：语义合理不等于有决策影响）。
+
+### Phase 13.1: capsule 时机——scared 收割窗口（C1，预期收益最大，先做）
+
+- 改动点：`shouldReturnHome()`。计算 `minScaredTimer = min(对手两个 ghost 的 scaredTimer)`（取 min：以最先醒的为准）。当 `minScaredTimer > 回家距离 + margin`（margin 先验取 8，不扫描）时：
+  - `carrying >= 3` 阈值提高到 `carrying >= 8`；
+  - 跳过 `score >= 5 且 carrying > 0` 的早退触发；
+  - `timeLeft` 触发保留不动（终盘安全网）。
+- 开关：环境变量 `HS_SCARED_WINDOW`（默认 off 时行为逐位不变），采纳后才固化为默认。
+- 预期效应链：吃 capsule → 不再 3 颗就回家 → 单次过界收割更多 → 均分上升。staffTeam 矩阵可测。
+
+### Phase 13.2: capsule 时机——被追时先转 capsule 再回家（C2，Phase 6 遗留 backlog）
+
+- 改动点：`getEffectiveLowLevelMode` 进入 go_home 前（或 `getGoHomeTargets` 内部），若同时满足：
+  - 此次回家由 ghost 压力触发（carrying > 0 且危险 ghost ≤ CLOSE_DISTANCE + 1）；
+  - 存在敌方半场 capsule，且 `mazeDist(我, capsule) <= min(mazeDist(我, 最近安全边界点), 先验上限 6)`；
+  - capsule 方向不比回家方向更危险（capsule 的 `getGhostTargetPenalty < 80`，复用现成函数）；
+  - 则目标改为该 capsule（吃到后 13.1 的窗口逻辑自然接管）。
+- 开关：`HS_CAPSULE_DETOUR`。注意与 13.1 叠加评估顺序：先单独 A/B，再合并跑。
+
+### Phase 13.3: 防守——scared 自保（D1）
+
+- 改动点：defence/patrol 路径上检查 `self scaredTimer > 0`：
+  - `getDefenceTargets()`：scared 且可见 invader 时，不再以 invader 当前位置为目标，改为"距 invader 2~3 格的 shadowing 点"（invader 合法邻域中离我最近且不与 invader 相邻的格子；候选为空则退到我方 capsule / 失窃 food 簇入口卡位）；
+  - `getSearchStepCost()` defence 分支：scared 时对距可见 invader ≤ 1 的格子加大代价（量级对齐现有 ghost 惩罚 35），防止 A* 路径顺路撞上去。
+  - scaredTimer 很大（> 20）且无近身 invader 时，维持现有协作释放逻辑转 attack（已有 `shouldReleaseDefenceForAttack` 通道，不新建机制）。
+- 开关：`HS_SCARED_DEF`。主要对照对手 bravo（它会吃 capsule 制造该场景）；13.0 的 `scaredChaseSteps` 是直接验收指标（应降到接近 0），均分为间接指标。
+
+### Phase 13.4: 防守——capsule 卡位与拦截（D3 + D2，依 13.0 触发率决定做哪个）
+
+- D3 capsule 卡位：可见 invader 且 `invaderDist(我方 capsule) <= myDist(我方 capsule) + 2` 时，defence 目标改为该 capsule（而不是追在 invader 身后）；invader 吃掉 capsule 的代价是全队防守崩塌，值得最高优先级。
+- D2 拦截：invader 可见但追不上（连续 N 步距离不减）时，目标改为"invader 与其回家边界列之间、`myDist(p) <= invaderDist(p)` 的最近卡点"。实现成本高于 D3，仅当 13.0 显示 bravo 局中存在大量"追而不获"步数时才做。
+- 开关：`HS_CAPSULE_GUARD` / `HS_INTERCEPT`，一次只开一个。
+- 明确不做：noisy distance 推断巡逻（D4）——信息噪声大、收益不可测（本地对手压不出场景），记入负面清单。
+
+### Phase 13.5: 验收矩阵与统计纪律（沿用 11/12 口径）
+
+- 所有 A/B 以**同日 flag-off 对照**为准；n=10 只当 smoke，固定图 n≥30（default 双峰教训）；bravo 对局方差大，一律 n≥30。
+- capsule 时机类（13.1/13.2）：staffTeam blox/default 正反向 n=30 + strategic ×10，均分不得低于对照；**RANDOM23 ×49 = 49/49 约束性验收**；`-c` ×10 无超时。
+- 防守类（13.3/13.4）：bravo blox ×30 + bravo RANDOM23 ×25 均分与防守计数器对照；staffTeam 全矩阵回归不得退化。
+- 任一项伤 RANDOM23 → 该项直接弃，不调参抢救。
+- 全部通过的项才把环境变量开关翻成代码默认值；提交前 flags 复核：`trainning=False`、`qlLowLevelModes=set()`、`qlDiagnostics=False`、`defDiagnostics=False`、`qlGuidedAStar=True`。
+
+### 执行顺序
+
+```text
+13.0 建尺子（半天级，决定 13.3/13.4 取舍）
+  → 13.1 scared 收割窗口（收益最大、改动最小）
+  → 13.2 capsule detour（Phase 6 遗留债）
+  → 13.3 scared 自保（bravo 可测）
+  → 13.4 仅做 13.0 证明触发率合格的那一个
+任何一步失败 → 回退 Phase 11 终态，该步记为否定性结果。
+```
+
+本轮 Phase 13 实验结果（详见 record.md 2026-06-13 Phase 13）：
+
+- 13.0 尺子先行起效：基线触发率把 D3 直接筛掉（capsuleLost 2/10），D2 升级为首要防守候选（staff blox chaseNoGain 70% + 每局丢 7 颗）。
+- **关键机制发现改写了 13.3 的前提**：capture.py 中 scared ghost 被吃后 scaredTimer 立即归零且 KILL_POINTS=0——"自杀式追击"是免费解除 40 步 debuff 的最优解，任何 scared 自保（shadowing）反而把防守冻结整个 scared 期。固定种子 A/B 实锤：flag-off +8，HS_SCARED_DEF 同种子被提前判负；bravo ×5 批量确认（+3.8/+5.2 vs 基线 +12.0/+10.4）。**弃。**
+- 13.4 拦截更惨（bravo default ×5 = **-2.2**，胜率 40%）：边界开口多，蹲守单一出口 = 放弃追击压迫，invader 在别处自由吃豆。"追而不获"的持续驱赶本身就是有效防守。**弃。**
+- 13.1 scared 收割窗口在 n=30 显著有害（default +4.6 vs +7.67，高分局率 67%→40%）：窗口判定的两难——min(scaredTimer) 因"防守吃 invader 即归零"永不触发，max 规则下已苏醒的 ghost 在收割加深时回防截杀。**弃。**
+- 13.2 capsule detour 中性（default +7.0 vs +7.67 噪声内，blox 0 触发），按"无收益不启用"惯例默认 off。
+- 验收：flag-off 与 Phase 11 终态 `-f` 固定种子逐位等价（default/blox diff 一致）；`-c` ×5 无超时；同日 flag-off n=30 回归 default 30/30 +7.67、blox 30/30 +9.13。**提交配置不变。**
+- 总结论：与 Phase 12 "风险信号饱和"互为印证——HS 防守/capsule 层在本地对手上同样已无廉价收益空间，Phase 4 的简单防守 + 现有 capsule 用法是本地局部最优。四个特性以默认无副作用旋钮形式保留（`HS_SCARED_WINDOW` / `HS_CAPSULE_DETOUR` / `HS_SCARED_DEF` / `HS_INTERCEPT` + `HS_DEF_DIAG` 诊断），供报告与真实对手出现后复验。
+
 ## Test Cases
 
 需要重点观察的行为场景：
