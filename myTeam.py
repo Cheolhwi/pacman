@@ -149,9 +149,13 @@ class MixedAgent(CaptureAgent):
         # bounded extra step cost inside attack-mode A* (path preference), the search
         # framework and targets stay pure heuristic search. Off => boundedAStarToTargets
         # behaves identically to pure HS.
-        self.qlGuidedAStar = False  # submission default: False, turn on for experiments
+        self.qlGuidedAStar = True  # passed the full Phase 11 acceptance matrix, on by default
         self.qlPathLambda = 0.03  # scale of (maxQ - q) added to the step cost
         self.qlPathCap = 1.0  # max extra cost per step from the QL preference
+        # Phase 11.0 diagnostic knob: comma separated offensive feature names whose
+        # weights are zeroed inside the search-time Q adapter only (training and the
+        # weights file stay untouched). Empty, the default, changes nothing.
+        self.qlPathAblateFeatures = set(filter(None, os.environ.get("QL_PATH_ABLATE", "").split(",")))
         # Read-only diagnostic counters for the q learning experiments (Phase 9.0).
         # They never change behaviour, final() prints one QL-DIAG line per game.
         self.qlDiagnostics = False
@@ -1132,16 +1136,19 @@ class MixedAgent(CaptureAgent):
         if ghosts:
             for b in homePoints:
                 ghostBoundaryDist[b] = min(self.getMazeDistance(nearestPoint(g), b) for g in ghosts)
+        weights = self.getOffensiveWeights()
+        if self.qlPathAblateFeatures:
+            # Phase 11.0 ablation: zero the named features in this read-only snapshot.
+            weights = {k: (0 if k in self.qlPathAblateFeatures else v) for k, v in weights.items()}
         return {
             "walls": walls,
-            "food": self.getFood(gameState),
             "capsules": set(self.getCapsules(gameState)),
             "ghosts": ghosts,
             "homePoints": homePoints,
             "ghostBoundaryDist": ghostBoundaryDist,
             "carrying": gameState.getAgentState(self.index).numCarrying,
             "recentSet": set(self.recentPositions),
-            "weights": self.getOffensiveWeights(),
+            "weights": weights,
             "cache": {},
         }
 
@@ -1151,7 +1158,11 @@ class MixedAgent(CaptureAgent):
         Dropped on purpose: stop/reverse (no Stop in search, no dithering in a path),
         closest-food/moves-toward-food (the A* heuristic and progress bonus already drive
         progress toward the HS-chosen target, a nearest-food pull would fight that target),
-        bias/carrying (constant across sibling moves, cancel under maxQ - q).
+        bias/carrying (constant across sibling moves, cancel under maxQ - q),
+        eats-food (Phase 11.0 ablation pinned it as the cause of the bloxCapture margin
+        regression: the en-route food pull buys corridor detours that fight the HS-chosen
+        target, same failure family as closest-food; dropping it turned blox from +5.3
+        to +8.7 while defaultCapture stayed neutral, n=50 each).
         The kept features only depend on nextPos, so the value is memoized per search."""
         cache = context["cache"]
         if nextPos in cache:
@@ -1160,11 +1171,8 @@ class MixedAgent(CaptureAgent):
         walls = context["walls"]
         ghosts = context["ghosts"]
         w = context["weights"]
-        x, y = nextPos
         q = 0.0
 
-        if context["food"][x][y]:
-            q += w.get("eats-food", 0)
         if nextPos in context["capsules"]:
             q += w.get("eats-capsule", 0)
 

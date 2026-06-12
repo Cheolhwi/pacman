@@ -496,6 +496,88 @@ Phase 6 结论：
 - **提交配置不变（纯 HS，`qlGuidedAStar = False`）**，权重还原 ckpt6。10.2 价值在报告：实证线性 QL 的结构特征被回报相关性毒化，连续两个 phase 的证据共同指向"学习偏好可注入但需非线性表达或更干净的特征设计"。
 - 事故与教训：批内 `conda run` 不转发 heredoc stdin 导致一次评估污染（已靠轮间快照完全恢复）；快照纪律再次救场。
 
+## Phase 11: Context-gated QL-guided A*
+
+背景与动机：
+
+- Phase 10.1 已证明：QL 作为有界附加代价注入 attack A* 时，随机图泛化完全无损（RANDOM23/42 49/49），且 defaultCapture 双向均分明显提升（+8.0 / 我方 +12.0）；唯一遗留问题是 bloxCapture 正向均分稳定下降 ~1.5（+5.5/+5.4 vs 基线 +7.0）。
+- Phase 10.2 已证明：靠"让 QL 学结构特征 + 重训"修 blox 走不通——结构特征被回报相关性毒化，重训再平衡虽修 blox 但吐掉 default 收益，净收益为零。
+- 因此 Phase 11 换路线：**不动权重、不重训、不加 feature**，只在推理侧给 QL 注入加"何时闭嘴"的门控——QL 偏好在开阔、低风险场景保留，在窄道等它已被证明添乱的场景关闭。核心问题：**能否在不丢 default 收益和随机图 49/49 的前提下，把 blox 正向均分恢复到基线 +7.0？**
+- 全部改动限定在 `boundedAStarToTargets` / `buildQLPathContext` 的推理路径上，`getSearchStepCost`、训练管线、`QLWeightsMyTeam.txt`（ckpt6）一律不动。flag off 时行为仍与纯 HS 完全等价。
+
+### Phase 11.0: 先确诊 blox 绕行的元凶 feature（不改算法）
+
+沿用 Phase 10.2 的消融方法：在 `buildQLPathContext` 的权重快照里逐个清零候选 feature，跑 bloxCapture 正向 ×10（flag on，ckpt6 权重），对比 +5.5 基准。
+
+候选嫌疑（按先验排序）：
+
+1. `eats-food`（≈ +28.4，顺路吃豆拉力，GPT 讨论的默认嫌疑）；
+2. `revisit`（ckpt6 为 -1.69；10.2 重训降到 -0.48 后 blox 自愈，是同等分量的嫌疑）；
+3. `dead-end`（≈ -1.4，会让 A* 在窄道入口付附加费）；
+4. `chance-return-food`（carrying>0 时的回家拉力，可能与 HS 选定目标打架）。
+
+判定规则：
+
+- 某个 feature 清零后 blox 恢复到 ≈ +7.0 → 它就是主毒，11.1 的门控设计以"在窄道场景屏蔽该信号"为目标；
+- 单清都不恢复、组合清零才恢复 → 说明是窄道里整体 q 差被放大，11.1 直接走 tunnel 门（整个扩展关 QL）；
+- 全清都不恢复 → 归因不在 QL 项本身，回到 10.1 数据复查（此分支概率低，因为 10.1 消融链已指向 QL 项）。
+
+确诊轮也要顺带跑一次 defaultCapture ×10，确认被清的 feature 是否同时是 default 收益的来源——如果同一个 feature 既是 blox 的毒也是 default 的药，就实锤了"必须按上下文门控、不能全局删"的设计前提。
+
+### Phase 11.1: 二值门控（一次只开一扇门，A/B 可归因）
+
+门控分两个注入粒度，分开实验，不混做：
+
+- **G1 tunnel 门（per-expansion）**：扩展节点 `pos`（或其任一后继）的 `self.tunnelDepth > 0` 时，本次扩展 `qlPenalty = {}`。复用 Phase 10.2 留下的 `computeTunnelDepthMap` 静态预计算，零额外开销。语义：QL 偏好只在开阔区域的兄弟动作间起作用，进入单出口走廊体系后 A* 完全按 HS 代价走。
+- **G2 carrying 门（per-search）**：`carrying >= 2` 时本次搜索 λ = 0（在 `buildQLPathContext` 判一次）。语义：没带豆时允许 QL 鼓励顺路吃豆；带豆后目标是安全回家，吃豆偏好不再参与。注意 `carrying >= 3` 本来就触发 go_home（不走 QL 引导），所以 G2 实际只影响 carrying 为 2 的窗口，预期是小修正。
+
+约束：
+
+- 门是二值的（λ = 0.03 或 0），不做多档 λ——多档位引入新调参维度，破坏 A/B 归因。
+- 实验顺序：先 G1 单独（首要假设），blox ×10 + default ×10；若 blox 恢复且 default 收益保住，G2 不做；若 blox 只部分恢复，再叠加 G2。
+- 每轮改动后先跑 flag-off 回归 ×3 确认等价性没被破坏（门控代码必须包在 `qlGuidedAStar` 分支内）。
+- "ghost 压迫 home boundary 时关 QL"（GPT 讨论提过）暂不做：该场景主要影响 go_home，而 go_home 从未接 QL 引导；attack 模式下 ghost 近身时 `getSearchStepCost` 的 3~100 量级惩罚本来就碾压 cap=1.0 的 QL 项。
+
+### Phase 11.2: 验收矩阵（全部以同日 flag-off 对照为准，沿用 10.1 口径）
+
+固定 `trainning=False`、`qlLowLevelModes=set()`、ckpt6 权重，候选配置 = flag on + 胜出的门控组合：
+
+1. flag-off 回归：defaultCapture ×10 与纯 HS 行为等价；
+2. bloxCapture 正向 ×10：均分恢复到同日 flag-off 对照水平（≈ +7.0），这是本阶段首要指标，先跑；
+3. defaultCapture 正反向 ×10：保住 10.1 的均分收益（明显高于同日 flag-off 对照，量级参考 +2.0 / +4.5）；
+4. bloxCapture 反向 ×10、strategicCapture ×10：不低于同日对照；
+5. 以上全过才跑 RANDOM23 / RANDOM42 各 ×49：必须 49/49；
+6. `-c` 计时 ×10：无超时判负。
+
+决策规则：
+
+- 全部通过 → `qlGuidedAStar = True` 首次具备成为提交默认值的资格（此前 10.1/10.2 均未达标），最终是否启用在提交前确认；
+- 标准 2 失败且 11.1 两扇门用尽 → 做一次 λ ∈ {0.01} 的窄道场景外全局缩小扫描（最后一招）；仍失败则提交默认保持 `qlGuidedAStar = False`，Phase 11 作为报告中"门控假设的否定性实验"收尾；
+- 标准 3 失败（门控误伤 default 收益）→ 检查门是否开得过宽（如 tunnel 门误盖开阔图的短走廊），收紧后重测一轮，仍失败同上回退。
+
+明确不做：
+
+- 不做"先生成 K 条候选路径再用 QL 排序"的 tie-break 架构重构——现有 per-expansion 相对归一化 + cap 已把 QL 限制在近似 tie-breaker 的量级（λ·maxΔq ≈ 0.85 < 1 步基础代价），若二值门控足以修复 blox，则没有理由支付该工程与验证成本；仅当 11.1 + λ 扫描全部失败且仍想保留 QL 引导时，另立 phase 评估。
+- 不重训、不动 ckpt6 权重文件、不加/删训练 feature（10.2 的教训：训练侧动结构特征只会学到混淆符号）。
+- 不做多档 λ、不做连续 gating 函数——保持二值门的可归因性。
+- go_home / defence / patrol 继续不接任何 QL 信号（escape 权重病态结论不变）。
+
+实验纪律（沿用 9/10 的教训）：
+
+- 本阶段不写权重，但凡跑训练相关命令前仍必须快照 `QLWeightsMyTeam.txt`；
+- 批内 flag 翻转用系统 `python3` heredoc 并在评估启动前 `grep` 验证生效（conda run 不转发 heredoc stdin 的事故不能重演）；
+- 需要看 agent stdout 的诊断局用 `-q`，批量评估用 `-Q`。
+
+本轮 Phase 11 实验结果（详见 record.md 2026-06-13）：
+
+- 11.0 确诊成功且改写结论：消融矩阵实锤 `eats-food`（+28.4）是 blox 绕行唯一主毒——推理侧清零后 blox 从 +5.3 恢复到 +8.6，且**反超** flag-off 基线 +7.0；`revisit` 是次要毒源（清零 +7.4），`dead-end` / `chance-return-food` 无关。全清零对照精确复现 flag-off 的 +7.0，消融机制自验证通过。
+- 重要副产物：**10.1 记录的 default 收益（+8.0/+12.0）被 n=50 大样本证伪为采样噪声**——default 比分呈 1/11 双峰，n=10 均分差 ±2 在噪声内；n=50 下 flag-off/方案 A/方案 B 的高分局率 56%/52%/44% 统计不可区分。
+- 11.1 方案判别（n=50 each）：只剔 `eats-food`（blox +8.68 / default 中性）vs 剔 `eats-food`+`revisit`（blox +9.08 / default 偏低）——blox 差异 1 SD 不可区分，default 偏向前者，**采用最小改动方案：从 `getQLPathValue` 永久剔除 `eats-food`**（与 `closest-food` 同属"与 HS 选定目标打架"失败族）。原计划的 tunnel/carrying 门控**不需要了**：剔除后处处不低于基线，无需上下文条件。
+- 11.2 验收 8/8 全通过：blox 正向 +9.0（>7.0 基线）、blox 反向我方 +8.2、default 正向 +7.5（n=20）、default 反向我方 +12.0（n=20）、strategic +6.1、**RANDOM23 49/49 +9.47**、RANDOM42 49/49 +9.94、`-c` 10/10 无超时——**`qlGuidedAStar = True` 首次通过全部验收标准，具备提交默认资格**。
+- 修正后的最终叙事：QL-guided A* 的真实收益在窄道图（blox +7.0 → +9.0），default/strategic 中性，随机图泛化无损；保留的 QL 信号是 ghost 邻近、dead-end、revisit、带豆回家拉力——一个风险感知 tie-breaker，而非吃豆引导。
+- 工具沉淀：`QL_PATH_ABLATE` 环境变量消融开关保留在代码中（默认空集、零行为影响），避免了批间翻转文件 flag 的事故面。
+- 提交 flags：`trainning=False`、`qlLowLevelModes=set()`、`qlDiagnostics=False`、`qlGuidedAStar=True`（首次默认启用）；ckpt6 权重未动。
+
 ## Test Cases
 
 需要重点观察的行为场景：

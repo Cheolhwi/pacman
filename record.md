@@ -381,3 +381,65 @@
 - **提交配置不变**：`trainning=False`、`qlLowLevelModes=set()`、`qlGuidedAStar=False`、`qlDiagnostics=False`；`QLWeightsMyTeam.txt` 还原为 ckpt6（与 git HEAD 一致，10.1 记录的所有结果可复现）。还原后 flag-off 回归 3/3 正常。
 - 对报告的价值：10.2 提供了一组干净的对照-消融链（特征加入 → 训练 → 检查点跷跷板 → 消融归因），实证了"线性 QL 的地图结构特征会被回报相关性毒化"，与 10.1 一起构成完整的 QL×A* 角色实验叙事。
 - 轮次权重快照保留在 /tmp/qlweights_p102_round{1,2,3}.txt 与 /tmp/qlweights_ckpt6_phase10_base.txt（重启后丢失，如需报告引用请自行转存）。
+
+## Phase 11: Context-gated QL-guided A*（实际收敛为 eats-food 剔除）
+
+日期：2026-06-13
+
+目标：按 PLAN.md Phase 11，先确诊 10.1 遗留的 bloxCapture 正向均分回退（+5.5 vs flag-off +7.0）的元凶 feature，再决定门控设计；不重训、不动 ckpt6 权重，全部改动限定在推理侧。
+
+### 实现：消融开关（取代批间文件 flag 翻转）
+
+- 新增环境变量 `QL_PATH_ABLATE`（逗号分隔 feature 名），在 `registerInitialState` 读入 `self.qlPathAblateFeatures`，仅在 `buildQLPathContext` 的只读权重快照里把命名特征清零——训练路径与权重文件完全不受影响，默认空集时行为与改动前逐位一致。
+- 动机：10.2 的 conda heredoc stdin 事故说明批间翻转文件 flag 是事故面；环境变量随命令显式传入，已验证 `conda run` 正确转发。
+
+### 11.0 消融矩阵（flag-on，ckpt6 权重，bloxCapture 正向 ×10）
+
+| 配置 | blox 均分 | 判定 |
+| --- | --- | --- |
+| A0 基准（全特征） | +5.3 | 复现 10.1 回退（+5.5/+5.4）✓ |
+| A1 清零 `eats-food` | **+8.6** | **元凶，且剔除后反超 flag-off 基线** |
+| A2 清零 `revisit` | +7.4 | 次要毒源 |
+| A3 清零 `dead-end` | +5.7 | 无关 |
+| A4 清零 `chance-return-food` | +5.6 | 无关 |
+| A5 全清零（flag-off 等价） | +7.0（10 局全 7） | 精确复现 flag-off，机制自验证 ✓ |
+
+### 重要副产物：10.1 的 default 收益被证伪为采样噪声
+
+defaultCapture 比分呈 1/11 双峰（差 1 局均分变 0.5），n=10 的 ±2 均分差在噪声内。大样本复测：
+
+| default 配置 | n=50 高分局率 | 均分 |
+| --- | --- | --- |
+| flag-off（全清零） | 56% | +6.6 |
+| 只剔 `eats-food` | 52% | +6.2 |
+| 剔 `eats-food`+`revisit` | 44% | +5.4 |
+| 全特征 flag-on（n=20） | 55% | +6.5 |
+
+两两差异均在 1.3 SD 内——**QL 引导在 default 上对所有配置都是中性**，10.1 记录的 +8.0/+12.0 收益是 n=10 的运气。同理 11.0 期间一次 D6 的 +4.0 低分也被 n=30 复跑（+6.3）证伪。教训：双峰分布的图，n=10 均分差 < 2 不能当信号。
+
+### 11.1 方案判别与采用
+
+- 方案 A（只剔 `eats-food`）：blox n=50 = **+8.68**，default 中性；
+- 方案 B（剔 `eats-food`+`revisit`）：blox n=50 = +9.08，default 偏低 ~1.2；
+- blox 上 A/B 差 1 SD 不可区分，default 偏向 A → **采用方案 A**：从 `getQLPathValue` 永久删除 `eats-food` 项（docstring 记录依据：顺路吃豆拉力与 HS 选定目标打架，与设计期丢弃的 `closest-food` 同失败族），`buildQLPathContext` 同步移除 food 快照。
+- **原计划的 tunnel/carrying 门控全部不需要**：元凶剔除后处处不低于基线，无需上下文条件——比门控更简单、零运行时开销、无新超参。
+
+### 11.2 验收矩阵（代码固化后，无环境变量，`qlGuidedAStar=True`，ckpt6）
+
+| 测试 | 结果 | 对照 | 判定 |
+| --- | --- | --- | --- |
+| bloxCapture 正向 ×10 | 10/10，**+9.0** | flag-off +7.0 | ✓ 10.1 回退翻转为净增益 |
+| bloxCapture 反向 ×10 | 10/10，我方 +8.2 | 基线 +7.5 | ✓ |
+| defaultCapture 正向 ×20 | 20/20，+7.5 | 同日 flag-off +6.6 | ✓ 中性 |
+| defaultCapture 反向 ×20 | 20/20，我方 +12.0 | 基线 +4.8~+7.5 | ✓ |
+| strategicCapture ×10 | 10/10，+6.1 | 同日量级 +6.7 | ✓ 日间方差内 |
+| **RANDOM23 ×49** | **49/49，+9.47** | 49/49，+9.5 | **✓ 约束性验收通过** |
+| RANDOM42 ×49 | 49/49，+9.94 | 49/49 | ✓ |
+| `-c` 计时 ×10 | 10/10，+4.0 | — | ✓ 无超时 |
+
+### 结论
+
+- **8/8 全通过，`qlGuidedAStar = True` 首次通过完整验收矩阵，具备提交默认资格**（10.1/10.2 均未达到）。提交 flags：`trainning=False`、`qlLowLevelModes=set()`、`qlDiagnostics=False`、`qlGuidedAStar=True`。
+- 修正后的最终叙事：QL-guided A* 的真实收益在窄道图（blox +7.0 → +9.0），default/strategic 中性，随机图泛化无损。保留的 QL 信号（ghost 邻近、dead-end、revisit、带豆回家拉力）构成一个**风险感知 tie-breaker**；被剔除的 `eats-food` 证明"学到的最大权重 ≠ 对路径规划最有用的信号"。
+- 对报告的价值：Phase 9（确诊方法）→ 10.1（角色反转）→ 10.2（结构特征毒化）→ 11（消融定位单一元凶 + 大样本证伪噪声收益）构成完整闭环；11 的消融矩阵 + n=50 复测是其中统计上最干净的一环。
+- 副作用已还原：`score` 已 checkout，权重文件与 ckpt6 逐位一致（diff 验证），仓内备份已移出。快照与全部运行日志在 /tmp/qlweights_phase11_ckpt6_snapshot.txt、/tmp/p11_*.log（重启后丢失）。
