@@ -92,6 +92,9 @@ class MixedAgent(CaptureAgent):
                                         'ghost-distance': 0,
                                         'dead-end': 0,
                                         'revisit': 0,
+                                        # Phase 10.2 structural features for random/narrow maps
+                                        'home-path-margin': 0,
+                                        'tunnel-depth': 0,
                                         },
             "defensiveWeights": {'numInvaders': -1000, 'onDefense': 100,'teamDistance':2 ,'invaderDistance': -10, 'stop': -100, 'reverse': -2},
             "escapeWeights": {'onDefense': 1000, 'enemyDistance': 30, 'stop': -100, 'distanceToHome': -20, '#-of-ghosts-1-step-away': -100},
@@ -126,6 +129,9 @@ class MixedAgent(CaptureAgent):
         self.lastObservedPosition = self.startPosition
         self.searchBudgetExhausted = False
         self.maxLowLevelExpansions = 600
+        # Phase 10.2: static per-map tunnel depth (steps to escape a single-exit
+        # corridor system, 0 = on a cycle/junction), feeds the tunnel-depth feature
+        self.tunnelDepth = self.computeTunnelDepthMap(gameState.getWalls())
         self.recentPositions = []
         self.stuckRecoverySteps = 0
         MixedAgent.sharedTargets[self.index] = self.startPosition
@@ -139,6 +145,13 @@ class MixedAgent(CaptureAgent):
         # on heuristic search because the full q learning agent is much weaker.
         # Set trainning to True together with these modes when trainning the weights.
         self.qlLowLevelModes = set()
+        # Phase 10.1: QL-guided A*. When on, the trained offensive Q values act as a
+        # bounded extra step cost inside attack-mode A* (path preference), the search
+        # framework and targets stay pure heuristic search. Off => boundedAStarToTargets
+        # behaves identically to pure HS.
+        self.qlGuidedAStar = False  # submission default: False, turn on for experiments
+        self.qlPathLambda = 0.03  # scale of (maxQ - q) added to the step cost
+        self.qlPathCap = 1.0  # max extra cost per step from the QL preference
         # Read-only diagnostic counters for the q learning experiments (Phase 9.0).
         # They never change behaviour, final() prints one QL-DIAG line per game.
         self.qlDiagnostics = False
@@ -1025,6 +1038,12 @@ class MixedAgent(CaptureAgent):
         bestCost = {start: 0}
         expansions = 0
 
+        # Phase 10.1: QL-guided A*, the trained offensive Q values shape the step cost
+        # of attack searches as a bounded preference between sibling moves.
+        qlContext = None
+        if self.qlGuidedAStar and mode == "attack" and self.qlPathLambda > 0:
+            qlContext = self.buildQLPathContext(gameState)
+
         while not frontier.isEmpty() and expansions < self.maxLowLevelExpansions:
             pos, path, costSoFar = frontier.pop()
 
@@ -1035,9 +1054,24 @@ class MixedAgent(CaptureAgent):
                 return path
 
             expansions += 1
-            for action in self.getLegalSearchActions(gameState, pos):
+            legalActions = self.getLegalSearchActions(gameState, pos)
+            qlPenalty = {}
+            if qlContext is not None and len(legalActions) > 1:
+                # Relative normalization per expansion: the locally preferred sibling pays 0,
+                # the others pay a capped non-negative surcharge. Never negative, so no
+                # "long paths look free" artifact and the heuristic stays an underestimate.
+                qValues = {
+                    action: self.getQLPathValue(qlContext, nearestPoint(Actions.getSuccessor(pos, action)))
+                    for action in legalActions
+                }
+                maxQ = max(qValues.values())
+                qlPenalty = {
+                    action: min(self.qlPathCap, self.qlPathLambda * (maxQ - qValue))
+                    for action, qValue in qValues.items()
+                }
+            for action in legalActions:
                 nextPos = nearestPoint(Actions.getSuccessor(pos, action))
-                newCost = costSoFar + self.getSearchStepCost(gameState, pos, nextPos, targets, mode)
+                newCost = costSoFar + self.getSearchStepCost(gameState, pos, nextPos, targets, mode) + qlPenalty.get(action, 0)
                 if newCost >= bestCost.get(nextPos, sys.maxsize):
                     continue
                 bestCost[nextPos] = newCost
@@ -1080,6 +1114,135 @@ class MixedAgent(CaptureAgent):
             stepCost += 0.25
 
         return max(0.2, stepCost)
+
+    #------------------------------- Phase 10.1: QL-guided A* (QL as path preference) -------------------------------
+    def buildQLPathContext(self, gameState: GameState) -> dict:
+        """Snapshot everything the search-time Q adapter needs, built once per A* call.
+        Ghosts come from getGhostLocs (including scared ghosts) on purpose: the offensive
+        weights were trained on features computed from that same set, so filtering it
+        differently here would evaluate the linear model off its training distribution.
+        Hard scared-aware safety stays the job of getSearchStepCost via
+        getVisibleDangerousGhosts, whose penalties dwarf the capped QL term."""
+        walls = gameState.getWalls()
+        ghosts = self.getGhostLocs(gameState)
+        homePoints = self.getHomeBoundaryPoints(gameState)
+        # Per-boundary-point closest ghost distance, precomputed once per search
+        # for the home-path-margin feature (constant while the search runs).
+        ghostBoundaryDist = {}
+        if ghosts:
+            for b in homePoints:
+                ghostBoundaryDist[b] = min(self.getMazeDistance(nearestPoint(g), b) for g in ghosts)
+        return {
+            "walls": walls,
+            "food": self.getFood(gameState),
+            "capsules": set(self.getCapsules(gameState)),
+            "ghosts": ghosts,
+            "homePoints": homePoints,
+            "ghostBoundaryDist": ghostBoundaryDist,
+            "carrying": gameState.getAgentState(self.index).numCarrying,
+            "recentSet": set(self.recentPositions),
+            "weights": self.getOffensiveWeights(),
+            "cache": {},
+        }
+
+    def getQLPathValue(self, context: dict, nextPos: Tuple[int, int]) -> float:
+        """Q-ish value of stepping onto nextPos, mirroring getOffensiveFeatures semantics
+        and normalizations exactly for the subset that is meaningful inside A*.
+        Dropped on purpose: stop/reverse (no Stop in search, no dithering in a path),
+        closest-food/moves-toward-food (the A* heuristic and progress bonus already drive
+        progress toward the HS-chosen target, a nearest-food pull would fight that target),
+        bias/carrying (constant across sibling moves, cancel under maxQ - q).
+        The kept features only depend on nextPos, so the value is memoized per search."""
+        cache = context["cache"]
+        if nextPos in cache:
+            return cache[nextPos]
+
+        walls = context["walls"]
+        ghosts = context["ghosts"]
+        w = context["weights"]
+        x, y = nextPos
+        q = 0.0
+
+        if context["food"][x][y]:
+            q += w.get("eats-food", 0)
+        if nextPos in context["capsules"]:
+            q += w.get("eats-capsule", 0)
+
+        if ghosts:
+            q += w.get("#-of-ghosts-1-step-away", 0) * sum(
+                nextPos in Actions.getLegalNeighbors(g, walls) for g in ghosts)
+            ghostDist = min(self.getMazeDistance(nextPos, nearestPoint(g)) for g in ghosts)
+            q += w.get("ghost-distance", 0) * ghostDist / (walls.width + walls.height)
+
+        if len(Actions.getLegalNeighbors(nextPos, walls)) <= 2:
+            q += w.get("dead-end", 0)
+        if nextPos in context["recentSet"]:
+            q += w.get("revisit", 0)
+
+        # Phase 10.2 structural features, mirroring getOffensiveFeatures.
+        # home-path-margin: skipped when no ghosts (constant 1.0 across siblings).
+        if ghosts:
+            bestMargin = max(
+                context["ghostBoundaryDist"][b] - self.getMazeDistance(nextPos, b)
+                for b in context["homePoints"]
+            )
+            q += w.get("home-path-margin", 0) * max(-1.0, min(1.0, bestMargin / (walls.width + walls.height)))
+        q += w.get("tunnel-depth", 0) * (min(self.tunnelDepth.get(nextPos, 0), 5) / 5.0)
+
+        carrying = context["carrying"]
+        if carrying > 0:
+            distHome = self.distanceToClosestTarget(nextPos, context["homePoints"]) + 1
+            q += w.get("chance-return-food", 0) * carrying * (1 - distHome / (walls.width + walls.height))
+
+        cache[nextPos] = q
+        return q
+
+    def computeTunnelDepthMap(self, walls) -> dict:
+        """Static map analysis for the tunnel-depth feature (Phase 10.2).
+        A cell's depth is how many steps it takes to get back to a cell that is on
+        a cycle or junction (the 2-core of the open-cell graph): the tip of a
+        length-5 dead-end corridor has depth 5, its mouth 1, open area 0.
+        Unlike dead-end (one cell, one exit) this sees whole single-exit corridor
+        systems, which is where random/narrow maps get our pacman trapped."""
+        openCells = set()
+        for x in range(walls.width):
+            for y in range(walls.height):
+                if not walls[x][y]:
+                    openCells.add((x, y))
+
+        def liveNeighbors(cell, alive):
+            x, y = cell
+            return [n for n in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)) if n in alive]
+
+        # Iterative degree<=1 pruning leaves the 2-core (cells on cycles).
+        core = set(openCells)
+        while True:
+            leaves = [c for c in core if len(liveNeighbors(c, core)) <= 1]
+            if not leaves:
+                break
+            core -= set(leaves)
+
+        depth = {}
+        if not core:
+            # Degenerate tree-shaped maze: every cell would be "in a tunnel",
+            # the feature carries no signal, keep it inert.
+            return {cell: 0 for cell in openCells}
+
+        # Multi-source BFS from the core through the pruned tree cells.
+        for cell in core:
+            depth[cell] = 0
+        frontier = list(core)
+        level = 0
+        while frontier:
+            level += 1
+            nextFrontier = []
+            for cell in frontier:
+                for n in liveNeighbors(cell, openCells):
+                    if n not in depth:
+                        depth[n] = level
+                        nextFrontier.append(n)
+            frontier = nextFrontier
+        return depth
 
     def getRecentPositionPenalty(self, nextPos: Tuple[int, int], mode: str) -> float:
         if mode not in ("defence", "patrol") or not self.recentPositions:
@@ -1519,6 +1682,23 @@ class MixedAgent(CaptureAgent):
         # policy paces in a tiny loop at a guarded boundary instead of trying another entry
         if (next_x, next_y) in self.recentPositions:
             features["revisit"] = 1.0
+
+        # Phase 10.2: can a ghost cut our best home route. For the best boundary
+        # point, how much earlier do we arrive than the closest ghost: positive
+        # margin = the route home is safe, negative = it can be cut off.
+        if ghosts:
+            bestMargin = max(
+                min(self.getMazeDistance(nearestPoint(g), b) for g in ghosts)
+                - self.getMazeDistance((next_x, next_y), b)
+                for b in homePoints
+            )
+            features["home-path-margin"] = max(-1.0, min(1.0, bestMargin / (walls.width + walls.height)))
+        else:
+            features["home-path-margin"] = 1.0
+
+        # Phase 10.2: how deep the next position sits inside a single-exit corridor
+        # system (entry-flexibility direction: larger = fewer ways to retreat).
+        features["tunnel-depth"] = min(self.tunnelDepth.get((next_x, next_y), 0), 5) / 5.0
 
         return features
 

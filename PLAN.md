@@ -439,6 +439,63 @@ Phase 6 结论：
 - 验收：L1 大幅超额（attack-only QL 在 default/blox/strategic 全部 10/10 且平均分超 HS）；L2 失败于 RANDOM23（24/49 vs HS 49/49），线性特征对随机地图族泛化差。
 - 按预设规则提交配置回退纯 HS（`qlLowLevelModes = set()`），回退后 defaultCapture 回归 10/10、+7.0 与基线一致。ckpt6 权重保留在 `QLWeightsMyTeam.txt` 作为报告素材。
 
+## Phase 10: QL 作为路径偏好（QL-guided A*）
+
+背景与动机：
+
+- Phase 9 的关键证据：attack-only QL 在固定图（default/blox/strategic）全部 10/10 且均分超 HS，但 RANDOM23 仅 24/49（HS 49/49）。QL 不是弱在"不会进攻"，而是弱在单步贪心线性模型对随机地图族泛化差；A* 的泛化能力仍然更强。
+- 这正是 Phase 9"明确不做"里预留的备选方向：**把 Q 值改作 A* 边代价**。本阶段反转 QL 与 A* 的角色——不再问"QL 能不能单独决定下一步"，而是问"QL 能不能帮 A* 在多条可行路中选更好的那条"。
+- 框架保持纯 HS：目标选择、A* 搜索、模式切换全部不变；ckpt6 训练出的 offensive Q 值只作为 attack 模式 A* 的局部代价修正项（路径偏好）。QL 判断错时 A* 仍然兜底，不会丢掉随机地图的稳定性。
+
+### Phase 10.1: flag 控制的 QL-guided A*（不重训）
+
+- 开关：`self.qlGuidedAStar`（提交默认 `False`，off 时 `boundedAStarToTargets` 与纯 HS 行为完全一致）、`self.qlPathLambda = 0.03`、`self.qlPathCap = 1.0`。
+- 注入点在 `boundedAStarToTargets` 而非 `getSearchStepCost`：相对归一化需要整个兄弟动作集合（后者一次只看一条边）；且 `getFallbackActionScore` 也调用 `getSearchStepCost`，改它会污染 fallback 评分。
+- 代价形式用**每次扩展的相对归一化**而非裸减法 `cost - λQ`：对被扩展节点的所有合法后继算 q，附加代价 `min(cap, λ·(maxQ - q))`。恒非负 → 无"负代价偏好长路径"伪影，Manhattan 启发式保持低估；局部最优兄弟恰好付 0；单出口走廊零开销。
+- 搜索时 Q 适配器 `getQLPathValue`：逐项镜像 `getOffensiveFeatures` 的语义和归一化（权重必须在训练分布上使用），但只保留对 A* 内部有意义的子集：
+  - 保留 `eats-food`、`eats-capsule`、`#-of-ghosts-1-step-away`、`ghost-distance`、`dead-end`、`revisit`、`chance-return-food`（仅 carrying>0）。
+  - 丢弃 `stop`/`reverse`（A* 内不适用）、`closest-food`/`moves-toward-food`（A* 启发式 + progress bonus 已驱动向 HS 选定目标推进，"最近 food"拉力会与选定目标打架——即"靠近合理目标而非最近 food"的意图，无需重训实现）、`bias`/`carrying`（兄弟间常数，在 maxQ−q 下抵消）。
+  - ghost 集合用 `getGhostLocs`（含 scared ghost），与训练一致；scared 安全规避仍由 HS 层 `getVisibleDangerousGhosts` 惩罚负责。
+  - 保留特征只依赖 nextPos，按 nextPos 记忆化，每次 A* 调用建一次 context 快照。
+- λ 量级：兄弟 q 差主导项是 `eats-food`（≈28.4）→ 0.03×28.4 ≈ 0.85 < 1 步基础代价；QL 只做 tie-breaker，远小于 HS ghost 惩罚（3~100）。
+
+### Phase 10.2: 地图结构特征（条件触发，暂不实现）
+
+仅当 10.1 验收通过或作为报告素材需要时再做：
+
+- `home-path-margin`：回家路是否会被鬼掐断的近似（max over 边界点 b 的 `mazeDist(ghost,b) − mazeDist(pos,b)`，归一化）。
+- `entry-flexibility`：是否身处长单出口走廊（`registerInitialState` 时静态预计算 tunnel-depth 图）。
+- 两个特征需同时加进 `getOffensiveFeatures`（训练路径）与 `getQLPathValue`（推理路径），并重训（快照权重 → `trainning=True`、`qlLowLevelModes={"attack"}`、Phase 9.3 检查点规则）。
+
+### Phase 10.3: 验收标准
+
+1. flag off 时与纯 HS 行为等价（defaultCapture 回归与基线一致）；
+2. flag on 时 RANDOM23 / RANDOM42 不得低于 HS 基线（49/49）——RANDOM23 为约束性验收，首跑；
+3. default / blox / strategic 正反向保持 10/10，均分不低于 HS 基线；
+4. 任一条不满足：先做 λ∈{0.01, 0.1} 扫描；扫描后随机图仍下降则提交版保持 `qlGuidedAStar = False`，QL-guided A* 仅作为报告实验。
+
+明确不做：
+
+- go_home / defence / patrol 不接 QL 引导（escape 权重病态：`distanceToHome ≈ +352`，不能泄漏进路径代价）。
+- 10.1 不重训、不改 reward、不动 `getSearchStepCost` 既有惩罚结构。
+- 不上经验回放、n-step return、神经网络（同 Phase 9 结论）。
+
+本轮 Phase 10 实验结果（详见 record.md 2026-06-13）：
+
+- 10.1 已实现并完成完整验收矩阵。核心假设验证成功：**RANDOM23 49/49（+9.47）、RANDOM42 49/49（+9.47）**，随机图泛化完全无损（Phase 9 纯 QL 在 RANDOM23 仅 24/49）——QL 作为有界附加代价时 A* 的全局路径能力完整保留。
+- 固定图胜率全部 10/10；defaultCapture 双向均分明显提升（正向 +8.0 vs 同日对照 +6.0，反向我方 +12.0 vs +7.5）；strategicCapture 与同日对照持平；bloxCapture 正向均分稳定下降 ~1.5（+5.5/+5.4 两次复跑 vs 对照 +7.0，窄道图里顺路吃豆偏好引向局部绕行）。
+- 验收：标准 1、2 通过；标准 3 胜率全通过但 blox 正向均分低于基线，严格执行 → 不完全达标，**提交默认值保持 `qlGuidedAStar = False`**。QL-guided A* 作为验证过的实验保留，单开关可启用。
+- 若做 10.2，窄道图均分回退是首要修复目标。
+
+本轮 Phase 10.2 实验结果（详见 record.md 2026-06-13）：
+
+- 已实现 `home-path-margin` + `tunnel-depth`（训练/推理双路径一致，`computeTunnelDepthMap` 静态预计算 2-core + 多源 BFS），重训 3 轮（每轮红蓝各 25 局 RANDOM，trainedEpisodes 重置 50 起步），按停训规则在 ckpt3 停止。
+- 检查点呈跷跷板：blox +7.0/+5.5/+7.0 对 default +4.0/+8.0/+3.0，无检查点同时达标。
+- 消融归因（关键结论）：**blox 修复来自重训的基础权重再平衡，与结构特征无关**；两个结构特征学到的都是混淆符号（margin 负、tunnel 正，与 Phase 9 `distanceToHome` 同病）、只有害，`home-path-margin` 是 default 回退的主毒。
+- 最优配置（结构特征清零）= 处处中性：blox +7.0、default +6.0 均持平基线——修了 blox 但吐掉 10.1 的 default 收益，净收益为零。
+- **提交配置不变（纯 HS，`qlGuidedAStar = False`）**，权重还原 ckpt6。10.2 价值在报告：实证线性 QL 的结构特征被回报相关性毒化，连续两个 phase 的证据共同指向"学习偏好可注入但需非线性表达或更干净的特征设计"。
+- 事故与教训：批内 `conda run` 不转发 heredoc stdin 导致一次评估污染（已靠轮间快照完全恢复）；快照纪律再次救场。
+
 ## Test Cases
 
 需要重点观察的行为场景：
