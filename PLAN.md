@@ -766,6 +766,81 @@ attack A* 返回路径后，对前 K=3~5 步累加 getQLPathValue（已 memoized
 - 验收：flag-off 与 Phase 11 终态 `-f` 固定种子逐位等价（default/blox diff 一致）；`-c` ×5 无超时；同日 flag-off n=30 回归 default 30/30 +7.67、blox 30/30 +9.13。**提交配置不变。**
 - 总结论：与 Phase 12 "风险信号饱和"互为印证——HS 防守/capsule 层在本地对手上同样已无廉价收益空间，Phase 4 的简单防守 + 现有 capsule 用法是本地局部最优。四个特性以默认无副作用旋钮形式保留（`HS_SCARED_WINDOW` / `HS_CAPSULE_DETOUR` / `HS_SCARED_DEF` / `HS_INTERCEPT` + `HS_DEF_DIAG` 诊断），供报告与真实对手出现后复验。
 
+## Phase 14: 压迫式防守——从“抓 invader”改为“降低对方有效收益”
+
+背景与定位：
+
+- Phase 13 定论：本地体系内“贴身追击 + 失窃点调查”已是局部最优，四个直觉增强方向全部证伪或中性。但 13.4 的失败机制同时给出正面线索：**压迫本身就是防守**——追而不获的持续驱赶使 invader 无法安心吃豆。本阶段不再增加“去哪里”的规则，而是改两件事：防守的评价方式（不看抓没抓到，看对方少吃、少带、晚回家了多少）和压迫的质量（追击位置软性偏向 invader 的回家方向）。
+- 测量尺子升级是本阶段第一公民（继承 12/13 的“本地对手全被碾压、均分饱和”结论）：胜率/均分对防守改动不敏感，主指标改为只读防守计数器（对方有效收益），并引入**镜像对手**（冻结在 Phase 11 终态的 myTeam 自身）作为本地最强攻击压力源——它是仓内唯一会带 3+ 颗豆冲回家、会绕 ghost、会双线进攻的对手，天然制造“对手带 4-6 颗准备回家”“双攻两路拉开”这类 staff/bravo 压不出的场景。
+- 回退点：Phase 11 终态（`qlGuidedAStar=True`、λ=0.03、ckpt6）。全部改动 env 门控，默认 off 时行为逐位不变。
+
+### Phase 14.0: 尺子升级——镜像对手 + 有效收益计数器（先建尺子，决定后续取舍）
+
+- 镜像对手：复制 myTeam.py 为 `frozenTeam.py`（Phase 11 终态行为），**把全部 HS_*/QL_* 环境变量读取硬编码为默认值**——capture.py 两队同进程，env flag 会同时作用于双方，冻结副本必须对 env 免疫才能做非对称 A/B。自检：frozenTeam vs frozenTeam 与 myTeam(flag-off) vs frozenTeam 的比分分布应一致。
+- 计数器扩展（沿用 `HS_DEF_DIAG` 通道，`final()` 打印）：
+  - `invaderFoodReturned`：对方实际送回家的豆数（防守的真实失败量，区别于只是“被吃走”的 foodLost）；
+  - `invaderMaxReturn`：单次最大送回量（“一次大额送回”风险的直接测量）；
+  - `invaderEscapes` / `invaderKills`：invader 带豆成功过界次数 / 被我方吃掉次数（区分“抓到”与“逼退”两种防守成功）；
+  - 已有 foodLost / invaderSteps / chaseNoGain 保留，chaseNoGain 在 14.1 里升级为“压迫未丢失”的守门指标。
+- 基线测量：myTeam(flag-off) vs frozenTeam、vs bravo，blox/default 各 ×10（`-q`）。**镜像局方差未知，先标定分布再定后续 n**；各 14.x 候选场景先看触发率，<1% 直接弃（13.0 纪律：语义合理不等于有决策影响）。
+
+### Phase 14.1: 追击中的回家方向压迫（软压迫，第一优先）
+
+- 与 13.4 硬拦截的本质区别：**永不放弃贴身**。目标永远在 invader 本体邻域内，只是当 `mazeDist(我, invader) >= 2` 时，把追击目标从 invader 当前格改为“invader 的合法邻格中更靠近其最近逃生出口一侧的那个”（逃生出口 = 敌方回家边界点中离 invader 最近者）；距离 ≤ 1 时退回原行为直接吃。蹲点 13.4 的病灶是目标硬切到远处出口、压迫归零——这里目标与 invader 始终相邻，只偏一格站位。
+- 实现挂点：`getDefenceTargets()` 的 `return self.sortTargetsByDistance(gameState, invaders)` 分支前插入 `getPressureTarget()`；复用 `getHomeBoundaryPoints` / `getMazeDistance`，零新增基础设施。
+- 开关 `HS_PRESS_HOME`。流程：先 `-f` 固定种子 smoke（13.3/13.4 都是固定种子先暴露提前判负），再批量 A/B。验收主指标：vs frozenTeam/bravo 的 `invaderFoodReturned`、`invaderEscapes` 下降；守门指标：`chaseNoGain` 不得上升（压迫未丢失的直接证据），staff 矩阵不退化。
+
+### Phase 14.2: 失窃点路径化——从地点到路线证据（第二优先）
+
+- `lastEatenFood` 从单点升级为短历史（deque 保留最近 K=3 个失窃点 + 步号）。当最近 N=40 步内同一区域（失窃点互距 ≤ 5）连续丢 ≥ 2 颗时，无可见 invader 的 defence 目标从“最新失窃格”改为“该区域指向边界的入口 choke”（复用 `getBoundaryChokepoints`，取离失窃质心最近者）——把失窃序列当成对方进入/撤退路线的证据，而不是反复回访最新丢豆格。
+- 单点丢失行为不变（防过度反应——“对手专吃边缘低价值豆”场景正是要避免被拉着跑）。明确不用 noisy distance（负面清单不变，这里只用确定发生过的 food loss）。
+- 开关 `HS_LOSS_TRAIL`。前置诊断：用 14.0 计数器测“同区域连续丢豆”在镜像/bravo 局的触发率，<1% 弃。
+
+### Phase 14.3: 主防 + 支援位（第三优先）
+
+- 不动“只留一个 primary defender、另一个释放进攻”的协作框架（bloxCapture 收益来源，不可回退）。只改一处：当队友正在追击可见 invader 且我处于 patrol（非 attack）模式时，patrol 点排序偏向 invader 逃生侧的边界 choke / 我方 capsule 侧。支援位**只影响 patrol 目标排序，永不把 attack 模式的 agent 拉回防守**——既不回到双防没进攻的旧坑，也不像 13.4 那样让唯一 defender 放弃追击。
+- 开关 `HS_SUPPORT_POS`。前置诊断：“队友追击 + 我在 patrol”同时态的步数占比；预期镜像局显著多于 staff 局，staff 局触发不足就只用镜像局验。
+
+### Phase 14.4: 比分/时间驱动的防守强度三档（条件触发，默认不做）
+
+- 现有 `shouldUseLateLeadDefence` 二值判断 → 三档：大幅领先时优先防“一次大额送回”（`invaderMaxReturn` 是直接尺子）；小领先/持平保持一主防一进攻；落后时只响应高威胁 invader（carrying > 0 或逼近 capsule），不被普通入侵拖节奏。
+- **触发条件（满足才立项，否则跳过）**：14.0 基线显示镜像局存在可测频次的“领先后被单次大额送回缩小分差”或“落后时双 agent 被低威胁 invader 牵制”。13.x 教训：先证明病灶存在，再写规则。
+
+### Phase 14.5: 验收矩阵与统计纪律（沿用 11/12/13 口径）
+
+- 防守类主战场：vs frozenTeam + vs bravo，blox/default n≥30（按 14.0 标定的方差调整），主指标 = `invaderFoodReturned` / `foodLost` / `invaderEscapes` 计数器 + 均分。
+- 无回归守门：staffTeam 全矩阵（blox/default 正反 n=30 + strategic ×10）均分不低于同日 flag-off；**RANDOM23 ×49 = 49/49 约束性验收**；`-c` ×10 无超时。
+- flag-off 逐位等价（`-f` 固定种子 diff 验证）；n=10 只当 smoke；一次只开一个 flag，叠加评估只在单项过关后做；任一项伤 RANDOM23 → 直接弃，不调参抢救。frozenTeam.py 仅作本地评估工具，不进提交。
+
+### 负面清单（Phase 13 定论，不再投入）
+
+- scared 自保 / shadowing（机制级证伪：scared ghost 之死免费且零分代价）；
+- 硬拦截 / 蹲出口（13.4：放弃贴身压迫 = 放任对方吃豆）；
+- scared 收割窗口（13.1 显著有害）、capsule 时机作为主方向（13.2 中性；除非真实比赛对手明显依赖 capsule 再重开）；
+- 纯 QL 防守、noisy distance 推断巡逻（历史定论不变）。
+
+### 执行顺序
+
+```text
+14.0 镜像对手 + 有效收益计数器（尺子先行，决定 14.2/14.3/14.4 取舍）
+  → 14.1 软压迫（固定种子 smoke → 批量 A/B）
+  → 14.2 失窃点路径化（触发率合格才做）
+  → 14.3 支援位（触发率合格才做）
+  → 14.4 仅在 14.0 暴露对应病灶时立项
+任何一步失败 → 回退 Phase 11 终态（提交资格不受影响），该步记为否定性结果。
+```
+
+一句话总纲：**防守不再追求“抓到”，只追求“对方带回家的豆变少”——压迫保贴身、站位偏回家侧，尺子从胜率换成对方有效收益，并用冻结的自己当本地最强对手。**
+
+本轮 Phase 14 实验结果（详见 record.md 2026-06-13 Phase 14）：
+
+- **14.0 镜像尺子立功**：frozenTeam（Phase 11 终态 env 免疫副本）逐位自检通过；镜像 blox 暴露 staff/bravo 测不到的病灶——flag-off 防守对自己的攻击 0 击杀、10 颗失窃全部被安全送回，红方 0/10 全败（-3.50，sd 0.53），是本地最锐利的防守仪器。镜像 default 双方互锁全 0-0，只当守门。副产物：bravo flag-off 基线本身有 -25 级爆破局，Phase 12/13 的 bravo 全胜记录含日间运气。
+- **14.1 → 14.1b 采纳（默认开启）**：纯软压迫在劣势侧赚（-3.5→-1.5）、优势侧亏（+3.4→+2.5）——压迫的代价是防守者被锁在追击中不再释放进攻；加 score≤0 门控后双向双赢（-1.5 / +3.7），bravo blox ×30 首次 30/30（+11.40，sd 0.72）、default +1.10→+8.03（爆破局 16/60→4/60），staff 全矩阵中性，**RANDOM23 ×49 = 49/49（每局 +11）**，`-c` 无超时。GPT 方案的第一优先（软压迫）与第四优先（比分驱动强度）被数据合并成同一特性。`HS_PRESS_HOME=0` 可关断，关断后与 Phase 11 终态逐位一致。
+- **14.2 弃**：触发率合格（130+ 步/局）但镜像 -3.5→-6.0 明确有害——蹲失窃簇的边界 choke 与 13.4 蹲点同族失败；按"任一仪器受伤即弃"纪律处理，旋钮保留默认 off。
+- **14.3 降级不做**：supportSteps 触发率在镜像上为 0（压迫开启后"队友防守+我巡逻"局面消失），bravo/staff 仅 ~4%，无判别尺子，记入 backlog。
+- 修复 14.0 计数器 bug：chooseAction 的 fallback 提前返回跳过诊断，恰好漏掉爆破局的大额送回事件。
+- 提交配置更新：`pressureHomeEnabled=True` 为 Phase 4 协作分工以来防守层首个通过完整验收矩阵的采纳项；其余新旋钮默认 off。
+
 ## Test Cases
 
 需要重点观察的行为场景：
