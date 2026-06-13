@@ -926,6 +926,88 @@ attack A* 返回路径后，对前 K=3~5 步累加 getQLPathValue（已 memoized
 - **关键再认识**：人工观战的"双防守"是自镜像退化现象，非普适 bug；镜像在此是过敏尺子。这支持 14.1c 已是本地局部最优。
 - **保留 15.0 诊断（默认 off 零影响），回退 15.1 行为代码（逐位 == HEAD）**。提交配置不变 = 14.1c。对手行为控制器方向（PLAN 主体）在本地缺乏能安全检验它的尺子，留待真实比赛对手——与 Phase 12/13 收官同理。
 
+## Phase 16: 回退纯 HS clean baseline + 服务器黑盒归因
+
+> 编号说明：GPT Pro 讨论里口头按"Phase 0/1/2/3"分段，但 PLAN 已用到 Phase 15，0-3 槽位语义冲突，故正式立为 Phase 16，子阶段 16.0-16.3 对应原 0-3。
+
+背景与定位：
+
+- **触发来源（首次真实尺子）**：服务器 PvP 池反馈，当前提交版（14.1c 线：`qlGuidedAStar=True` + `pressureHomeEnabled=True`）胜率约 1/3，**弱于纯 HS**。这是 Phase 11-15 全程缺失的"强对手 + 黑盒泛化"信号，直接推翻 Phase 15 收官时"14.1c 已是局部最优、提交配置不变"的隐含假设——**本地局部最优 ≠ 竞赛池最优**。
+- **代码审计发现（2026-06-13）**：
+  - [myTeam.py:370-411](myTeam.py#L370-L411) 的 5 个 print（plan 重算 2 个 + 每步 high/low action 3 个）**无条件**每步写 stdout。Pacman CTF 有 1s/步动作预算，超时累积 warning → forfeiture；服务器即使不展示日志也未必不计 stdout IO/时间。这是"隐藏超时"的头号嫌疑。
+  - [myTeam.py:156](myTeam.py#L156) `qlGuidedAStar=True` 硬编码、无 env 开关；[myTeam.py:213](myTeam.py#L213) `pressureHomeEnabled` 默认开。当前默认 = HS + QL 路径偏置 + 压迫式防守，**不是纯 HS**。
+  - frozenHsTeam.py 行为上≈"纯 HS clean baseline"（`qlGuidedAStar=False` 且根本无压迫逻辑）——既是本地"硬闯型"对手基准，又是变体 A 的现成参照。record 14 附加已测出 14.1b 对 frozenHS = -2.20（不比 off 稳），本地这把尺子其实早已与服务器结论同向。
+- **方法论定位**：本地是钝尺（staff/berkeley/bravo/镜像全被碾压或过敏），只做三件事——①排除超时/IO ②检测回归 ③把"哪个 flag 拖后腿"做归因；**强弱排名最终裁判 = 服务器池**，一次只回退/加回一个变量。这是 Phase 12/13/15 反复吃过的亏（本地证伪不了的就交给真实对手）。
+- 回退点：当前 HEAD（14.1c 终态）。全部改动 env 门控，默认 off 时 `-f` 逐位等价。
+
+### Phase 16.0: 卫生 + 超时排查（唯一本地即可定论的阶段，先做）
+
+测的是 IO/超时而非策略强度，故本地结论可直接外推服务器。
+
+- **16.0a print 门控**：加 `DEBUG = bool(os.environ.get("PACMAN_DEBUG"))` + `dprint()`（走 stderr），把 myTeam.py:370/371/377/391/411 全替换 `dprint`。提交时不设 `PACMAN_DEBUG`。
+- **16.0b 行为等价**：门控前后 `-f` 同种子，确认 plan/action 序列逐位一致（只少打印）。
+- **16.0c 超时实测**：`capture.py -c` 计时，对比 prints-on vs prints-off 单步耗时、有无 `timed out`/warning。判定：prints-off 明显更快 / warning 消失 → IO/超时即服务器低胜率主因之一，此项单独立即提交。
+
+### Phase 16.1: `qlGuidedAStar` env 门控 + 变体定义（同一二进制，翻 env 切换）
+
+- myTeam.py:156 改 `self.qlGuidedAStar = os.environ.get("QL_GUIDED","0") not in ("","0")`（**默认 off**）。提交默认即纯 HS（QL 偏置关 + 压迫关）。
+- 变体（全靠 env，杜绝代码分叉/隐藏差异）：
+
+| 变体 | env | 含义 |
+| --- | --- | --- |
+| A 纯HS clean | （默认全空） | 提交基线 |
+| A+QL | `QL_GUIDED=1` | 单独看 QL 偏置 |
+| A+Press | `HS_PRESS_HOME=1` | 单独看压迫式防守 |
+| 当前线 | `QL_GUIDED=1 HS_PRESS_HOME=1` | = 现服务器版 |
+
+### Phase 16.2: 本地 A/B 归因（对手 = frozenHsTeam + 当前线，钝尺仅归因/回归）
+
+目的不是"证明 A 更强"（钝尺做不到），而是归因哪个 flag 对硬闯型拖分 + 确认 A 不输当前线。沿用 mirror 同侧 + RANDOM23 ×49 纪律。
+
+1. **vs frozenHsTeam**（硬闯基准）四变体各 n≥30：A 应从当前线 ~-2.20 回升到 ≥0；`A+Press` 若明显劣于 A → 复现 14.1b 压迫被打穿，确认压迫该关；`A+QL` vs A 看 QL 净影响。
+2. **A vs 当前线 头对头** n≥30：A 至少不输，理想占优 → 直接支持回退。
+3. **等价性回归**：A 配置 vs frozenHsTeam 在 defaultCapture 应接近 0-0 deadlock（mirror-on-default 回归守卫特征），验证 A 确退化成纯 HS。
+4. **RANDOM23 ×49 = 49/49** 约束验收 + `-c` 计时无超时。
+5. 跑完 `git checkout -- score`。
+6. （可选）bravo n≥30：唯一能压出双攻/双防牵制的本地对手，验"关压迫是否被双攻惩罚"。是否加由用户定（本轮指定对手集为 frozenHs + 当前线）。
+
+### Phase 16.3: 服务器提交阶梯（真尺子，一次一变量）
+
+统计纪律：单对手 20 局 SE≈0.10，只看多对手聚合，5-7pp 差异需 ~200 局才可信。不一次合并多特性（黑盒无法归因）。
+
+```text
+A（纯HS clean + prints gated）  ← 先提交，回答"低胜率来自实验性偏置/IO 还是策略"
+  └─若 A 明显 > 当前线 → 暂不恢复 QL/压迫，按下列单变量加回
+     ├─ B: A + 落后时 return 阈值 3→4/5（温和进攻，最便宜）
+     ├─ D: A + 轻量 belief 防守（契合被动行为读取偏好，优先级高于 B）
+     └─ E: A + route-based attack target（每趟多带回 1-2 颗）
+```
+
+### 明确不做（负面清单）
+
+- **不做 GPT 变体 C（固定一攻一守硬角色）**——与用户"硬角色 too dead"取向冲突，且 Phase 15 角色滞回已判弃（角色抖动对某些对手是 feature）。
+- 不重新启用 Phase 13 `scaredWindow`（本地显著有害，已判弃）。
+- 不一次合并 B/D/E；不在本地钝尺上调参抢救任何变体（本地只归因，不下强弱定论）。
+- 不用 noisy distance 当硬输入；belief（变体 D）只做"可能位置集合"轻量版，非完整 particle filter。
+
+### 执行顺序与终止条件
+
+```text
+16.0 卫生+超时（print 门控 + -c 计时）  ← 本地即可定论，最先做
+  → 16.1 qlGuidedAStar env 门控 + 变体定义
+  → 16.2 本地 A/B 归因（frozenHs + 当前线；RANDOM23 49/49 守门）
+  → 16.3 提交 A，等池结果；A 明显占优才按单变量加回 B/D/E
+任何一步伤 RANDOM23 或"本地不输当前线"的底线 → 回退 HEAD，该步记否定结果。
+```
+
+一句话总纲：**真实尺子（服务器）首次说话且推翻本地结论——先门控 print 排除隐藏超时、把默认翻回纯 HS clean baseline，再以服务器黑盒胜率一次一变量加回能泛化的东西；本地只用来排超时/查回归/做归因，不再当强弱裁判。**
+
+本轮 Phase 16 实验结果（详见 record.md 2026-06-13 Phase 16）：
+
+- **16.0/16.1 完成**：print 全门控（`PACMAN_DEBUG`+`dprint`，大字符串额外 `if DEBUG:`）；`qlGuidedAStar` env 门控默认 OFF、`pressureHomeEnabled` 默认翻 OFF → 提交默认 = 纯 HS clean。
+- **16.0c 推翻"print 隐藏超时"假设**：prints on/off 单步差 ~0.1ms，全配置 0 warning 0 timeout（距 1s 线 3-4 个数量级）。门控保留为卫生，病因转向策略。
+- **16.2 本地无法区分 A 与当前线、且 A 回归安全**：RANDOM23 49/49（+9.47 逐分历史一致）、defaultCapture 0-0 deadlock 等价、头对头 side-controlled 净值打平（A +0.135 vs 当前线 −0.135）。唯一偏向当前线的 frozenHS 近镜像（−1.6 vs −2.6）= 过敏尺子伪信号（Phase 15 已定性）。→ 提交 A，强弱交 16.3 服务器。
+
 ## Test Cases
 
 需要重点观察的行为场景：
