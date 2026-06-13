@@ -842,6 +842,90 @@ attack A* 返回路径后，对前 K=3~5 步累加 getQLPathValue（已 memoized
 - 提交配置更新：`pressureHomeEnabled=True` 为 Phase 4 协作分工以来防守层首个通过完整验收矩阵的采纳项；其余新旋钮默认 off。
 - **附加轮（详见 record.md Phase 14 附加）**：纯 HS 镜像对手（frozenHsTeam）测出两件事——QL 引导价值首次被本地尺子检出（劣势侧 5-8/10 胜局）；14.1b 对"风险中性硬闯型"攻击手失效（-9.6，钉死依赖对手的风险规避）。修复 = **14.1c 保险丝**：压迫期间对手成功送回一次 → 本局退回贴身追杀。全验收矩阵复跑通过（vs HS -9.6→-2.2、vs QL 钉死无损、RANDOM23 49/49）。14.1 最终形态 = 软压迫 + 比分门控 + 失效保险丝，三个组件各对应一类对手测出的失效模式。
 
+## Phase 15: 动态角色分工（攻防硬约束）
+
+> 编号说明：上一轮对话里口头叫它"14.2"，但 PLAN 的 14.2 槽位已被（已判弃的）失窃点路径化占用，故正式立为 Phase 15。
+
+背景与定位：
+
+- 触发来源：人工观战 14.1c vs Phase 11 镜像局，肉眼发现**两个 agent 都塌进防守、敌人很远就开始防**。诊断证实——同一固定种子局，红队两 agent 的 PDDL 高层动作进攻步从 Phase 11 的 223 步崩到 14.1c 的 37 步（agent0 281/300 步在 defend）。这是 14.1 压迫的**涌现副作用**而非记分板能报警的回归。
+- 机制（两层叠加）：
+  - 高层 PDDL（`getGoals` → `goalScoring`）的负目标"我方半场无敌方 pacman"在 invader 被压迫钉死后**永不满足**，于是持续给两个 agent 都派 defend 动作。
+  - 低层 `getEffectiveLowLevelMode` 的"一攻一防"不变量其实已存在（`shouldReleaseDefenceForAttack` → `shouldHoldAttackDefenceRole` → `isPrimaryDefenderForTargets`），但**每步用瞬时距离 + `sharedModes` 重算，无滞回、有竞态、且双方"在家未过界"时都满足防守资格**，所以塌缩 + 抖动。
+  - 14.1c 的"score≤0 才压迫"门控放大了这一切：镜像局长期 score≤0 → 压迫常开 → invader 长期被钉 → PDDL 长期双防。
+- 为什么记分板掩盖了它：镜像局是唯一能让我长期 score≤0 的本地对手，那里"塌缩防守"反而是这张图能拿到的最好结果（-1.5 优于对称地板 -3.7）；bravo/staff/RANDOM23 因为我能得分→score>0→压迫解除→进攻恢复，所以全部正常。**真实风险**：遇到强到能一直压我 score≤0 的比赛对手，我会塌进全防守、再也翻不了身——正是要根除的"双防没进攻"老坑从压迫副作用的后门带回来。
+- 回退点：14.1c 终态（已提交，`pressureHomeEnabled=True` + 保险丝）。全部改动 env 门控（`HS_ROLE_LOCK`，默认 off 时行为逐位不变）。
+
+### 设计取向（用户决策 2026-06-13）：自适应而非硬性 1-1
+
+- 人工质疑"硬性一攻一防也很死"，方向定为**被动读对手在线行为 → 自适应决定防守强度（人数 + 压迫狠度）**，带滞回。明确**砍掉主动试探 + 对手策略分类查表**——本地只有 3-4 个对手（staff/berkeley/bravo/frozen），分类器无法验证；5 格精确 + 远处 noisy distance（负面清单）让试探不可观测；300 步 + 1s/步预算下试探在送分；且属 Phase 7-9 证伪过的高复杂度家族。
+- 核心转变：**防守人数是"测出来的威胁"的结果，不是 score 门控、也不是硬规则**。这同时根治观察到的 bug（持续落后→双防塌缩）并统一了搁置的 14.4（比分驱动强度）——因为"落后"只是威胁的一个弱代理，真正该驱动的是对手是否真的在突破/送分。
+
+### Phase 15.0: 在线对手行为信号 + 角色诊断尺子（先建尺子）
+
+- **诚实更正先行**：上一轮抓的"37 进攻步"是 PDDL **高层动作**，不是真正驱动移动的 effective mode（后者会把 defence 翻成 attack）。15.0 必须抓 **effective mode**（`getEffectiveLowLevelMode` 的返回值）。
+- **在线对手行为信号**（大半已是 Phase 14 计数器，被动、便宜、5 格内确定可见）：
+  - `liveInvaders`：当前在我方半场的对手 pacman 数（控制器主输入）；
+  - `bankingRate`：`invaderFoodReturned` / 已用步数（对手是真送分还是只骚扰/试探）；
+  - `breachDepth`：invader 向我方食物核心的最大穿透深度（真威胁 vs 蹲边界）；
+  - `recentBleed`：最近 K 步失窃 food（当下是否在流血）；
+  - `ourOffenseAlive`：我方是否至少一个 agent 在 attack / 带豆 go_home（**bug 检测器**）。
+- **角色诊断计数器**（沿用 `HS_DEF_DIAG`，记 effective mode）：`noAttackerSteps`（无人进攻，直接测 bug）、`bothDefendSteps`、`roleFlips`（抖动）、`defenderCountByTier`（各威胁档下实际防守人数，验证控制器映射）。
+- 基线测量：14.1c flag-off/on 跑镜像 blox ×10、镜像落后场景（见 15.2）、bravo default/blox ×10、staff default ×10。**先确认这些信号能在本地对手间分离**：bravo 双攻应 `liveInvaders`≈2 + `bankingRate` 高；staff 应低；镜像应 `liveInvaders` 中等但 `bankingRate` 低（互锁）。若信号分不开对手类型，控制器没有可用输入，降级回最小闭环（"落后+无人进攻→强放一个进攻手"）。
+
+### Phase 15.0 实测修正（2026-06-13，详见 record.md）
+
+- 信号**能**分离对手类型：`twoInvaderSteps` 拎出 bravo 双攻（77 vs 其余 <11），`roleFlips` 拎出镜像病态（241 vs staff 15）——控制器方向立得住。
+- 但诊断**推翻了原 bug 假设**：`noAttackerSteps`（无人进攻）与胜负不相关（输球的镜像最低 64、赢球的 staff 100）。**真病灶是 roleFlips=241 的角色抖动**（无滞回每步重算 + 重置 lowLevelPlan）。
+- 故 15.1 重心调整：**主修复 = 角色滞回/承诺（掐抖动）；防守人数自适应降为次要**。判别病态抖动用 `roleFlips 高 AND twoInvaderSteps 低`（区别于 bravo 由真实双威胁正当化的高 churn）。
+
+### Phase 15.1: 角色滞回 + 防守强度控制器（核心改动）
+
+- 控制器：输入上述信号 → 输出**目标防守人数 ∈ {0,1,2} + 压迫强度**。挂在 `getEffectiveLowLevelMode` / `getCooperativeModeOverride`（既有覆盖层，不动 PDDL）。先验阈值各取一个值，不做多维扫描（11/12 教训）。
+- 映射（示意，阈值在 15.0 基线上标定）：
+  - 对手**双攻猛送分**（`liveInvaders`≥2 且 `bankingRate` 高 / `breachDepth` 深）→ 2 防 + 压迫全开；
+  - 对手**单攻或试探骚扰**（`liveInvaders`≤1 或 `bankingRate` 低）→ 1 防 1 攻；
+  - 对手**龟缩/蹲边界**（`liveInvaders`≈0）→ 0-1 防，释放第二个去进攻（别派人防空气）。
+- **bug 根治闭环（硬下限，与 score 无关）**：`ourOffenseAlive` 为假且对手并非"双真实深入送分"时 → 强制防守人数降到 1、放出一个进攻手。这取代 14.1c 的隐式 score 门控成为保证进攻手存在的机制——落后但对手没真突破时不再塌缩。
+- 滞回（消抖动/竞态）：目标防守人数每 K 步至多切换一次，且信号需持续若干步才触发换档；primary defender 身份用稳定键（带承诺，并列取小 index）。
+- 与 14.1c 解耦：压迫只作用于控制器指派的 defender；压迫**强度**的 score≤0 门控可保留（只调"压不压"），但防守**人数**由威胁驱动。
+- 显式例外（保留双防守）：双真实深入 invader；`shouldUseLateLeadDefence` 残局收尾；进攻手无 food 可吃（清场）。
+- 开关 `HS_ROLE_CTRL`。先 `-f` 固定种子 smoke（effective-mode 分布 + 各档防守人数），再批量。
+
+### Phase 15.2: 验收矩阵（落后场景 + 对手类型分离为主尺子）
+
+- **主尺子 1——镜像落后场景**：我方持续 score≤0（镜像 blox 天然长期化；需更强压制用 frozenHsTeam）。主指标：`noAttackerSteps` 显著下降、`roleFlips` 下降，**且均分不劣于 14.1c**（镜像 -1.5、vs frozenHS -2.2 是底线）。
+- **主尺子 2——对手类型响应**：bravo（双攻）下控制器应判 2 防；staff（弱攻）下应判 1 防 1 攻并保住进攻产出。用 `defenderCountByTier` 验证映射，均分不劣于 14.1c。
+- 无回归守门（全部不劣于 14.1c 同日对照）：镜像 blox 正/反向 ×10；bravo default/blox ×30；staff blox/default ×30 + strategic ×10；**RANDOM23 ×49 = 49/49 约束性验收**；`-c` 计时 ×10 无超时。
+- flag-off（`HS_ROLE_CTRL=0`）与 14.1c 终态 `-f` 逐位等价；任一项伤 RANDOM23 或镜像均分 → 直接弃，不调参抢救。
+
+### 明确不做（负面清单）
+
+- **不做主动试探 + 对手策略分类查表**（本地无法验证 + 不可观测 + 送分 + 过度工程化，见设计取向）；分类只能是被动行为统计，且只用于调防守强度，不切换大策略。
+- 不退回"双防守"作为常态；不动 14.1c 压迫/保险丝（已验收，只在其上加控制器）。
+- 不重写 PDDL 目标层（`myTeam.pddl` 不动）——只在 effective-mode 覆盖层加控制器。
+- 不用 noisy distance 当控制器输入——只用 5 格内确定可见的 invader / 失窃点 / 食物核心。
+- 不做 attacker/defender 连续权重混合（Phase 7-9 证伪的 hybrid）；角色离散、带滞回。
+
+### 执行顺序与终止条件
+
+```text
+15.0 在线信号 + 角色尺子（抓 effective mode；确认信号能分离对手类型）
+  → 信号分不开对手 → 降级最小闭环（落后+无人进攻→强放进攻手）
+  → 15.1 防守强度控制器（威胁驱动人数 + 滞回 + 与压迫解耦）
+  → 15.2 落后场景 + 对手类型响应 + 全回归矩阵
+任何一步伤 RANDOM23 或镜像均分 → 回退 14.1c 终态，该步记为否定性结果。
+```
+
+一句话总纲：**被动读对手在线行为决定投入几个防守、压多狠——威胁大就多防、龟缩就多攻、落后但对手没真突破就别塌缩；自适应而非硬规则，砍掉付不起也验不了的主动试探，且不退化 14.1c 已验收的压迫收益。**
+
+本轮 Phase 15 实验结果（详见 record.md 2026-06-13 Phase 15）：
+
+- **15.0 尺子先行兑现**：信号能分离对手类型（`twoInvaderSteps` 拎出 bravo 双攻、`roleFlips` 拎出镜像病态），但**推翻了原 bug 假设**——`noAttackerSteps` 与胜负不相关，真病灶是 roleFlips=241 的角色抖动（无滞回每步重算 + 重置 lowLevelPlan）。15.1 重心据此从"强放进攻手"改为"角色滞回"。
+- **15.1 四变体全判弃**：commitment-lock（领先局失聪崩）、debounce（追硬闯崩 frozenHS）、score 门控（bravo blox 崩）、score+invader 门控（frozenHS 崩）——每个只把回归平移。根因：**角色抖动对自镜像是 bug、对真实攻击手是 feature**，区分条件与对手类型纠缠太深，几个门控分不开 = 在 3-4 个本地对手上过拟合。
+- **关键再认识**：人工观战的"双防守"是自镜像退化现象，非普适 bug；镜像在此是过敏尺子。这支持 14.1c 已是本地局部最优。
+- **保留 15.0 诊断（默认 off 零影响），回退 15.1 行为代码（逐位 == HEAD）**。提交配置不变 = 14.1c。对手行为控制器方向（PLAN 主体）在本地缺乏能安全检验它的尺子，留待真实比赛对手——与 Phase 12/13 收官同理。
+
 ## Test Cases
 
 需要重点观察的行为场景：

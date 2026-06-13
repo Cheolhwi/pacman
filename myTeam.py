@@ -107,6 +107,10 @@ class MixedAgent(CaptureAgent):
     CURRENT_ACTION = {}
     sharedTargets = {}
     sharedModes = {}
+    # Phase 15.0 read-only: each agent's latest effective mode + carrying flag,
+    # so the diagnostics can see whether ANY teammate is producing offense this
+    # step. {index: (effectiveMode, carryingFlag)}. Never drives behaviour.
+    diagEffMode = {}
 
 
     def registerInitialState(self, gameState: GameState):
@@ -221,6 +225,9 @@ class MixedAgent(CaptureAgent):
         self.lossTrailEnabled = bool(os.environ.get("HS_LOSS_TRAIL"))
         self.recentFoodLosses = []   # [(observation step, position)], pruned to 40 steps
         self.defenceObsStep = 0
+        # Phase 15.1 role hysteresis was tried here and REJECTED (4 variants, each
+        # relocated the regression — see record.md / getEffectiveLowLevelMode).
+        # The 15.0 read-only role diagnostics below stayed; the behaviour did not.
         self.chaseNoGainStreak = 0
         self.lastChaseDistance = None
         # Phase 13.0: read-only defence/capsule-timing diagnostic counters
@@ -253,7 +260,16 @@ class MixedAgent(CaptureAgent):
             # defence (chasing) while I'm in patrol — the only situation the
             # support-positioning feature would change.
             "supportSteps": 0,
+            # Phase 15.0 online opponent-behaviour signals + role diagnostics.
+            # liveInvaders uses isPacman (known regardless of distance), so it is
+            # exact every step, unlike the visible-only invaderSteps above.
+            "oneInvaderSteps": 0,   # steps with exactly 1 opponent pacman on our side
+            "twoInvaderSteps": 0,   # steps with 2 opponent pacmen on our side
+            "noAttackerSteps": 0,   # steps where NEITHER of our agents produces offense (the bug)
+            "bothDefendSteps": 0,   # steps where both our agents are in a defensive posture
+            "roleFlips": 0,         # this agent's attack<->defence effective-mode switches
         }
+        self.defDiagPrevOffenseRole = None  # "offense" / "defence" last step, for roleFlips
         self.defDiagLossHistory = []
         self.defDiagStep = 0
         self.defDiagPrevCapsules = len(self.getCapsulesYouAreDefending(gameState))
@@ -650,6 +666,12 @@ class MixedAgent(CaptureAgent):
             if not agentState.isPacman and (self.getVisibleInvaders(gameState) or self.lastEatenFood is not None):
                 return "defence"
         return mode
+        # Phase 15.1 (role hysteresis) was REJECTED here — see record.md. Four
+        # variants (commitment-lock, debounce, score-gated, score+invader-gated)
+        # each only relocated the regression: role-flicker is pathological in the
+        # degenerate self-mirror standoff but productive against real attackers,
+        # and the splitting conditions are too entangled with opponent type to
+        # separate on 3-4 local opponents without overfitting. 14.1c stands.
 
     def getCooperativeModeOverride(self, gameState: GameState, mode: str):
         agentState = gameState.getAgentState(self.index)
@@ -836,6 +858,40 @@ class MixedAgent(CaptureAgent):
                 self.defDiagCounts["invaderKills"] += 1
                 self.defDiagCounts["invaderFoodDropped"] += previousCarried
             self.defDiagPrevOppCarrying[opponent] = carried
+
+        # Phase 15.0: online opponent-behaviour + role signals (read-only).
+        # liveInvaders from isPacman is exact every step (no 5-cell gating).
+        liveInvaders = sum(
+            1 for opponent in self.getOpponents(gameState)
+            if gameState.getAgentState(opponent).isPacman
+        )
+        if liveInvaders == 1:
+            self.defDiagCounts["oneInvaderSteps"] += 1
+        elif liveInvaders >= 2:
+            self.defDiagCounts["twoInvaderSteps"] += 1
+
+        # An agent "produces offense" if it is attacking or carrying food home.
+        myOffense = mode == "attack" or (mode == "go_home" and myState.numCarrying > 0)
+        MixedAgent.diagEffMode[self.index] = (mode, myState.numCarrying > 0)
+        teamOffense = False
+        teamDefence = True
+        for teammate in self.getTeam(gameState):
+            entry = MixedAgent.diagEffMode.get(teammate)
+            if entry is None:
+                teamDefence = False
+                continue
+            tmode, tcarry = entry
+            if tmode == "attack" or (tmode == "go_home" and tcarry):
+                teamOffense = True
+                teamDefence = False
+        if not teamOffense:
+            self.defDiagCounts["noAttackerSteps"] += 1
+        if teamDefence:
+            self.defDiagCounts["bothDefendSteps"] += 1
+        offenseRole = "offense" if myOffense else "defence"
+        if self.defDiagPrevOffenseRole is not None and offenseRole != self.defDiagPrevOffenseRole:
+            self.defDiagCounts["roleFlips"] += 1
+        self.defDiagPrevOffenseRole = offenseRole
 
         invaders = self.getVisibleInvaders(gameState)
         if invaders:
